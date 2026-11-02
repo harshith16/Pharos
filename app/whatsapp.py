@@ -11,7 +11,9 @@ as a CEO alias. Unknown senders are employees.
 Document/image messages are downloaded via the Graph API, saved
 under MEDIA_DIR, recorded via store.ingest_media, and — for documents
 with extractable text — ingested as searchable documents with facts
-extracted through the existing extract_and_store pipeline. The sender
+extracted through the existing extract_and_store pipeline, and into
+the engine graph (chunked ingest, entities, relations, dedup), so
+WhatsApp questions answer from the graph. The sender
 always gets an honest confirmation: what was read, or plainly that
 no text could be extracted. Nothing is ever claimed that did not
 happen.
@@ -28,9 +30,10 @@ faking delivery. A missing credential is likewise reported honestly as
 import os
 import re
 import uuid
+import asyncio
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app import config
@@ -136,6 +139,58 @@ def _run_answer(company_id: str, role: str, question: str) -> str:
                 pass
 
     return generate_answer(question, context_facts=context_facts)
+
+
+def _answer_text(company_id: str, role: str, question: str) -> str:
+    """Engine-first WhatsApp text answer; "" when nothing answers.
+
+    (1) The engine's multi-hop query (entities + relations, role
+    filter enforced), synthesized by the Meta LLM; its wrapper falls
+    back to legacy retrieval internally when the engine path fails
+    or is empty. Only a non-empty, non-canned result is returned.
+    (2) When both yield nothing, _run_answer (legacy retrieval +
+    general Meta chat) so casual messages still get a raw model reply.
+    (3) "" otherwise — the caller sends nothing and logs the failure.
+    Only the model's raw answer is ever returned; no canned text.
+    """
+    try:
+        from app.db import get_conn
+        from app.engine import query as engine_query
+
+        conn = None
+        ctx = None
+        try:
+            candidate = get_conn()
+            if hasattr(candidate, "__enter__"):
+                ctx = candidate
+                conn = ctx.__enter__()
+            else:
+                conn = candidate
+            result = engine_query.answer_question_engine_or_legacy(
+                conn, company_id, role, question
+            )
+        finally:
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+            elif conn is not None and hasattr(conn, "close"):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        answer = result.get("answer") if isinstance(result, dict) else ""
+        if (
+            isinstance(result, dict)
+            and not result.get("empty")
+            and isinstance(answer, str)
+            and answer.strip()
+        ):
+            return answer
+    except Exception:
+        pass
+    try:
+        return _run_answer(company_id, role, question)
+    except Exception:
+        return ""
 
 
 def _safe_filename(name: str) -> str:
@@ -340,6 +395,26 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
                 )
             except Exception:
                 fact_ids = []
+            # Engine ingest (dual-write): the same content becomes
+            # part of the interconnected graph — chunked ingest,
+            # entity extraction, relation building, content-hash
+            # dedup — so WhatsApp questions answer from the graph.
+            # A failure here is logged only; the legacy ingest above
+            # already stands, so the upload still answers via fallback.
+            try:
+                from app.engine import ingest as engine_ingest
+
+                engine_ingest.ingest_text(
+                    conn, company_id, text, msg["filename"],
+                    title=msg["filename"],
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("whatsapp_webhook").exception(
+                    "Engine ingest failed for WhatsApp media %s",
+                    msg["filename"],
+                )
     from app.llm import generate_doc_reply
 
     filename = msg["filename"]
@@ -395,69 +470,50 @@ async def verify_whatsapp(request: Request):
     return PlainTextResponse("forbidden", status_code=403)
 
 
-@router.post("/webhook/whatsapp")
-async def receive_whatsapp(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"status": "ignored"}, status_code=200)
+async def _handle_messages(messages: list) -> None:
+    """Background worker: answer and deliver every parsed message.
 
-    import json
+    Runs after the webhook POST has returned 200, so a slow model or
+    Graph call can never stall the webhook. Every failure is logged
+    and that message is skipped — never an empty or canned send, and
+    never a claim about work that did not happen.
+    """
     import logging
+
     _log = logging.getLogger("whatsapp_webhook")
-    _log.info("Received WhatsApp Webhook payload: %s", json.dumps(payload)[:500])
-
-    messages = parse_incoming(payload)
-    if not messages:
-        return {"status": "ok", "replies": []}
-
-    _log.info("Parsed %d incoming message(s): %s", len(messages), messages)
     token = config.WHATSAPP_TOKEN
     phone_id = config.WHATSAPP_PHONE_ID
     company_id = _company_id()
-
-    replies_drafted = []
-    sent_ids = []
-    graph_errors = []
-    template_required = False
-
+    if not token or not phone_id:
+        _log.warning(
+            "WhatsApp not configured; %d message(s) skipped, nothing sent or ingested",
+            len(messages),
+        )
+        return
     for msg in messages:
         sender = msg["sender"]
         if msg["kind"] == "text":
             try:
-                reply = _run_answer(company_id, _role_for(sender), msg["text"])
-            except Exception as exc:
-                _log.exception("Error running answer for message: %s", exc)
-                reply = ""
-            if not reply:
-                from app.llm import generate_answer
-                reply = generate_answer(msg["text"])
-        else:
-            if not token or not phone_id:
-                replies_drafted.append(
-                    {
-                        "to": sender,
-                        "body": (
-                            f"Got your {msg['kind']} ({msg['filename']}), "
-                            "but WhatsApp isn't configured, so I couldn't "
-                            "download or read it."
-                        ),
-                    }
+                # Sync DB + LLM work runs in a thread so the event
+                # loop stays free for other requests while answering.
+                reply = await asyncio.to_thread(
+                    _answer_text, company_id, _role_for(sender), msg["text"]
                 )
-                continue
+            except Exception as exc:
+                _log.exception("Error answering message: %s", exc)
+                reply = ""
+        else:
             try:
                 reply = await _process_media(company_id, msg, token)
             except Exception as exc:
                 _log.exception("Media processing failed: %s", exc)
-                graph_errors.append(
-                    {"to": sender, "error": f"media processing failed: {exc}"}
-                )
                 continue
-
-        if not token or not phone_id:
-            replies_drafted.append({"to": sender, "body": reply})
+        if not reply or not reply.strip():
+            _log.error(
+                "Model produced no reply for message from %s; nothing sent",
+                sender,
+            )
             continue
-
         recipient_to_use = sender
         test_recip = config.WHATSAPP_TEST_RECIPIENT
         if test_recip and (
@@ -466,27 +522,35 @@ async def receive_whatsapp(request: Request):
             or len(sanitize_phone_number(sender)) < 10
         ):
             recipient_to_use = test_recip
-
-        _log.info("Delivering reply to %s: %s", recipient_to_use, reply[:100])
         async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-            kind, detail = await _deliver(client, phone_id, token, recipient_to_use, reply)
+            kind, detail = await _deliver(
+                client, phone_id, token, recipient_to_use, reply
+            )
             if kind == "error" and test_recip and recipient_to_use != test_recip:
-                _log.warning("Primary delivery failed, retrying to test recipient %s", test_recip)
-                kind, detail = await _deliver(client, phone_id, token, test_recip, reply)
+                _log.warning(
+                    "Primary delivery failed, retrying to test recipient %s",
+                    test_recip,
+                )
+                kind, detail = await _deliver(
+                    client, phone_id, token, test_recip, reply
+                )
+        _log.info("Delivery result for %s: kind=%s", recipient_to_use, kind)
 
-        _log.info("Delivery result for %s: kind=%s, detail=%s", recipient_to_use, kind, detail)
-        if kind == "sent":
-            sent_ids.append(detail)
-        elif kind == "template_required":
-            template_required = True
-            replies_drafted.append({"to": sender, "body": reply})
-        else:
-            graph_errors.append(detail)
 
-    if not token or not phone_id:
-        return {"status": "not_configured", "replies_drafted": replies_drafted}
-    if template_required:
-        return {"status": "template_required", "replies_drafted": replies_drafted}
-    if graph_errors and not sent_ids:
-        return {"status": "error", "errors": graph_errors}
-    return {"status": "sent", "graph_message_ids": sent_ids, "errors": graph_errors}
+@router.post("/webhook/whatsapp")
+async def receive_whatsapp(request: Request, background_tasks: BackgroundTasks):
+    """Acknowledge immediately; answering + sending run in the background.
+
+    Meta requires a fast 200; the model and Graph calls happen after
+    the response is sent, so a slow answer can never stall the webhook
+    or trigger Meta retries.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "ignored"}, status_code=200)
+    messages = parse_incoming(payload)
+    if not messages:
+        return {"status": "ok", "replies": []}
+    background_tasks.add_task(_handle_messages, messages)
+    return {"status": "accepted", "messages": len(messages)}

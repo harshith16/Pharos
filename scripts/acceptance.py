@@ -49,6 +49,21 @@ def cleanup(conn):
     conn.execute("DELETE FROM chunks WHERE company_id = %s", (COMPANY,))
     conn.execute("DELETE FROM documents WHERE company_id = %s", (COMPANY,))
     conn.execute("DELETE FROM memories WHERE company_id = %s", (COMPANY,))
+    # Engine tables are new since this suite was written; wipe them
+    # too so reruns stay deterministic (engine ingest dedups on text
+    # hash, so a stale upload row would otherwise suppress re-ingest).
+    try:
+        conn.execute(
+            "DELETE FROM engine_relations WHERE company_id = %s", (COMPANY,)
+        )
+        conn.execute(
+            "DELETE FROM engine_entities WHERE company_id = %s", (COMPANY,)
+        )
+        conn.execute(
+            "DELETE FROM engine_uploads WHERE company_id = %s", (COMPANY,)
+        )
+    except Exception:
+        pass
     conn.commit()
 
 
@@ -582,12 +597,14 @@ def main():
             "txt/docx/pdf ok, png/empty -> None",
         )
 
-        # WhatsApp media webhook, two honest paths. (1) No Graph
-        # token: download is impossible, so the reply must say so
-        # and nothing is ingested. (2) Dummy token + patched
-        # download/deliver (no real Graph calls): the full intake
-        # pipeline runs — save, ingest, honest confirmation — and
-        # the confirmation body is captured from the send path.
+        # WhatsApp media webhook, two honest paths under the new
+        # background contract: POST returns 200 + accepted at once
+        # and the work happens after. (1) No Graph token: nothing
+        # is downloaded, ingested, or sent. (2) Dummy token +
+        # patched download/deliver/doc-reply (no real Graph or LLM
+        # calls): the full intake pipeline runs — save, ingest
+        # (legacy + engine), honest confirmation — and the
+        # confirmation body is captured from the send path.
         import tempfile
 
         wa_payload = {
@@ -624,6 +641,8 @@ def main():
         os.environ["MEDIA_DIR"] = tempfile.mkdtemp(prefix="wa_media_")
         real_download = wa_mod._download_media
         real_deliver = wa_mod._deliver
+        llm_mod = None
+        real_doc_reply = None
 
         async def _fake_download(token, media_id):
             assert media_id == "media-txt-1"
@@ -638,49 +657,88 @@ def main():
         wa_mod._download_media = _fake_download
         try:
             wa_client = TestClient(app)
-            # Path 1: no token -> honest "couldn't download" draft.
+            # Path 1: no token -> 200 + accepted, and the background
+            # task skips everything: nothing ingested, nothing sent.
+            import time
+
             wa_resp = wa_client.post("/webhook/whatsapp", json=wa_payload)
             wa_body = wa_resp.json()
-            drafted = wa_body.get("replies_drafted") or []
-            draft_text = drafted[0].get("body", "") if drafted else ""
-            path1_ok = (
-                wa_body.get("status") == "not_configured"
-                and "policy.txt" in draft_text
-                and "couldn't download" in draft_text
-            )
-            # Path 2: dummy token + patched Graph calls -> full intake.
-            os.environ["WHATSAPP_TOKEN"] = "dummy-token"
-            os.environ["WHATSAPP_PHONE_ID"] = "12345"
-            wa_mod._deliver = _fake_deliver
-            wa_resp2 = wa_client.post("/webhook/whatsapp", json=wa_payload)
-            wa_body2 = wa_resp2.json()
-            confirm_text = sent_bodies[0] if sent_bodies else ""
-            doc_row = conn.execute(
+            time.sleep(0.5)
+            doc_row1 = conn.execute(
                 "SELECT custom_id FROM documents WHERE custom_id = %s",
                 ("whatsapp:wamid-doc-1",),
             ).fetchone()
-            media_row = conn.execute(
+            media_row1 = conn.execute(
                 "SELECT filename FROM media WHERE company_id = %s "
                 "AND filename = %s",
                 (COMPANY, "policy.txt"),
             ).fetchone()
+            path1_ok = (
+                wa_resp.status_code == 200
+                and wa_body.get("status") == "accepted"
+                and doc_row1 is None
+                and media_row1 is None
+                and not sent_bodies
+            )
+            # Path 2: dummy token + patched Graph calls -> full intake.
+            # The doc-reply LLM call is stubbed (no Meta key in this
+            # VM); the pipeline — save, ingest, deliver — is real.
+            os.environ["WHATSAPP_TOKEN"] = "dummy-token"
+            os.environ["WHATSAPP_PHONE_ID"] = "12345"
+            wa_mod._deliver = _fake_deliver
+            import app.llm as llm_mod
+
+            real_doc_reply = llm_mod.generate_doc_reply
+            llm_mod.generate_doc_reply = lambda filename, text, n: (
+                f"Got it — saved {filename} and added it to the brain."
+            )
+            wa_resp2 = wa_client.post("/webhook/whatsapp", json=wa_payload)
+            wa_body2 = wa_resp2.json()
+            confirm_text = ""
+            doc_row = None
+            media_row = None
+            engine_row = None
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                confirm_text = sent_bodies[0] if sent_bodies else ""
+                doc_row = conn.execute(
+                    "SELECT custom_id FROM documents WHERE custom_id = %s",
+                    ("whatsapp:wamid-doc-1",),
+                ).fetchone()
+                media_row = conn.execute(
+                    "SELECT filename FROM media WHERE company_id = %s "
+                    "AND filename = %s",
+                    (COMPANY, "policy.txt"),
+                ).fetchone()
+                engine_row = conn.execute(
+                    "SELECT custom_id FROM documents WHERE company_id = %s "
+                    "AND title = %s AND custom_id LIKE 'engine:%%'",
+                    (COMPANY, "policy.txt"),
+                ).fetchone()
+                if confirm_text and doc_row and media_row and engine_row:
+                    break
+                time.sleep(0.2)
             path2_ok = (
-                wa_body2.get("status") == "sent"
+                wa_resp2.status_code == 200
+                and wa_body2.get("status") == "accepted"
                 and "policy.txt" in confirm_text
                 and ("saved" in confirm_text or "added" in confirm_text)
                 and doc_row is not None
                 and media_row is not None
+                and engine_row is not None
             )
             check(
                 "whatsapp-media-webhook",
                 path1_ok and path2_ok,
-                f"path1={path1_ok} draft={draft_text[:60]} "
+                f"path1={path1_ok} "
                 f"path2={path2_ok} confirm={confirm_text[:60]} "
-                f"doc={doc_row} media={media_row}",
+                f"doc={doc_row} media={media_row} engine={engine_row}",
             )
         finally:
             wa_mod._download_media = real_download
             wa_mod._deliver = real_deliver
+            if llm_mod is not None:
+                llm_mod.generate_doc_reply = real_doc_reply
             for key, val in wa_env.items():
                 if val is None:
                     os.environ.pop(key, None)
