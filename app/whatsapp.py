@@ -104,17 +104,19 @@ def _media_reply(kind: str, filename: str, text, fact_count: int,
     return f"Got it — I've saved {filename}. You can ask me questions about it."
 
 
-def _answer_text(company_id: str, role: str, question: str) -> str:
+def _answer_text(company_id: str, role: str, question: str, sender: str = "") -> str:
     """WhatsApp text answer, decided entirely by the engine router.
 
     This layer makes no routing decision of its own: it opens a
     connection, hands the question to the engine router, and returns
     what the router decides — an engine answer from uploaded facts,
-    the plain not-found reply, or a small-talk model reply that makes
-    no factual claim. An empty router answer (e.g. a model failure on
-    the small-talk route) returns "" so the caller sends nothing.
-    Only the router's answer text is ever returned; no canned factual
-    text and no word list lives here.
+    the plain not-found reply, a small-talk model reply that makes
+    no factual claim, or, for the ACT route, the result of executing
+    the decided action (app.actions sends the real email and this
+    returns its honest confirmation). An empty router answer (e.g. a
+    model failure on the small-talk route) returns "" so the caller
+    sends nothing. Only the router's answer text is ever returned;
+    no canned factual text and no word list lives here.
     """
     try:
         from app.db import get_conn
@@ -132,6 +134,12 @@ def _answer_text(company_id: str, role: str, question: str) -> str:
             result = engine_router.answer_question(
                 conn, company_id, role, question
             )
+            if isinstance(result, dict) and result.get("route") == "ACT":
+                from app import actions
+
+                return actions.handle_act(
+                    conn, company_id, role, sender, result
+                )
         finally:
             if ctx is not None:
                 ctx.__exit__(None, None, None)
@@ -456,7 +464,8 @@ async def _handle_messages(messages: list) -> None:
                 # Sync DB + LLM work runs in a thread so the event
                 # loop stays free for other requests while answering.
                 reply = await asyncio.to_thread(
-                    _answer_text, company_id, _role_for(sender), msg["text"]
+                    _answer_text, company_id, _role_for(sender), msg["text"],
+                    sender,
                 )
             except Exception as exc:
                 _log.exception("Error answering message: %s", exc)

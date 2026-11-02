@@ -551,6 +551,85 @@ def generate_smalltalk(message: str) -> str:
         return ""
 
 
+def compose_email(target_display: str, topic: str, facts: list) -> str:
+    """Draft a workplace email from engine facts ONLY, or "".
+
+    The model receives the covering facts and nothing else, and is
+    instructed to use only them: no invented figures, names, dates,
+    or policy details. Returns "" when no key is set, the call fails,
+    or the model returns no content — the caller then falls back to
+    the deterministic facts rendering, so an email is never composed
+    from anything but facts. Same null-content guard discipline as
+    every other LLM path in this module.
+    """
+    key = _api_key().strip()
+    if not key:
+        return ""
+    usable = []
+    for fact in facts or []:
+        if not isinstance(fact, dict):
+            continue
+        text = fact.get("fact")
+        if isinstance(text, str) and text.strip():
+            usable.append(text.strip())
+    if not usable:
+        return ""
+    fact_block = "\n".join(f"- {text}" for text in usable)
+    url = _api_base().rstrip("/") + "/chat/completions"
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "model": _api_model(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are drafting a professional workplace "
+                            "email. Use ONLY the facts listed below. Do "
+                            "not invent any figure, name, date, or policy "
+                            "detail, and do not use any other knowledge. "
+                            "If a detail is not in the facts, leave it "
+                            "out. Start with a subject line, then the "
+                            "email body."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Write an email to {target_display} about "
+                            f"{topic}, using only these facts:\n{fact_block}"
+                        ),
+                    },
+                ],
+                "max_tokens": 600,
+                "temperature": 0.2,
+            },
+            headers={
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+            },
+            timeout=30.0,
+            trust_env=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = _message_content(data)
+        if not content or not content.strip():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "compose_email returned no content; caller falls back"
+            )
+            return ""
+        return content.strip()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("compose_email error: %s", exc)
+        return ""
+
+
 def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str | None:
     """Extract and transcribe all text, numbers, and information from image bytes using Meta Model API."""
     import base64

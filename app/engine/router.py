@@ -19,6 +19,13 @@ From those signals it routes to exactly one of:
 - LLM_DIRECT: a short non-question utterance with no engine coverage
   (a greeting or pleasantry). The model reply must make no factual
   claim; it is produced by app.llm.generate_smalltalk.
+- ACT: an action request ("inform HR about my reimbursement"). The
+  action verb is generic language, but the TARGET and the TOPIC both
+  resolve against engine data: the target is a stored entity the
+  engine knows as an approver (source of an approves-type relation
+  learned from uploads), and the topic has role-filtered covering
+  facts. The router only decides ACT; app.actions executes the real
+  email send, and the WhatsApp layer only sends the resulting reply.
 
 The split between NOT_FOUND and LLM_DIRECT for zero-coverage messages
 uses ONLY message structure, never vocabulary: a question mark, a
@@ -57,8 +64,25 @@ NOT_FOUND_REPLY = "I couldn't find that in the company documents."
 ENGINE = "ENGINE"
 NOT_FOUND = "NOT_FOUND"
 LLM_DIRECT = "LLM_DIRECT"
+ACT = "ACT"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Generic action verbs. Linguistic structure only, like the
+# interrogative set: these mark a message as a request to do
+# something, they carry no domain or product facts. The target and
+# topic are never taken from a list — both resolve from stored rows.
+_ACTION_VERBS = {
+    "inform",
+    "tell",
+    "email",
+    "mail",
+    "notify",
+    "message",
+    "contact",
+    "alert",
+    "send",
+}
 
 # Generic English interrogatives. Linguistic structure only: these
 # mark a message as a question, they carry no domain or product facts.
@@ -137,6 +161,157 @@ def _word_count(question: str) -> int:
     return len(_TOKEN_RE.findall(question or ""))
 
 
+def _link_entities_by_token(conn, company_id, message) -> list:
+    """Stored entities whose name/alias tokens appear in the message.
+
+    Whole-word token overlap only, in order of first appearance in
+    the message. This is how "inform HR about my reimbursement" finds
+    the stored entity HR Lead via its hr token even though the full name
+    never appears in the message. Every candidate comes from a stored
+    row — nothing is invented, and no role list is consulted.
+    """
+    words = _TOKEN_RE.findall((message or "").lower())
+    if not words:
+        return []
+    positions = {}
+    for i, word in enumerate(words):
+        positions.setdefault(word, i)
+    hits = []  # (first_pos, display)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, display_name, aliases FROM engine_entities "
+                "WHERE company_id = %s",
+                (company_id,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        return []
+    for name, display, aliases in rows:
+        shown = None
+        if isinstance(display, str) and display.strip():
+            shown = display.strip()
+        elif isinstance(name, str) and name.strip():
+            shown = name.strip()
+        if not shown:
+            continue
+        forms = [shown]
+        if isinstance(aliases, (list, tuple)):
+            forms += [a for a in aliases if isinstance(a, str)]
+        elif isinstance(aliases, str) and aliases.strip():
+            forms.append(aliases)
+        best = None
+        for form in forms:
+            for tok in _TOKEN_RE.findall(form.lower()):
+                if tok in positions and (best is None or positions[tok] < best):
+                    best = positions[tok]
+        if best is not None:
+            hits.append((best, shown))
+    hits.sort()
+    out = []
+    seen = set()
+    for _pos, shown in hits:
+        if shown not in seen:
+            seen.add(shown)
+            out.append(shown)
+    return out
+
+
+def _approver_entities(conn, company_id) -> set:
+    """Display names the engine knows as approvers, from stored rows.
+
+    An approver is an entity that is the SOURCE of an approves-type
+    relation (rel "approves", or any rel containing the "approv"
+    stem, which covers LLM-extracted triples like "approved_by").
+    The relation exists only because an upload said so — e.g. "The
+    HR Lead approves the Reimbursement Policy." No role list is
+    consulted; an entity nobody's upload made an approver of can
+    never become an email target.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT e.display_name FROM engine_relations r "
+                "JOIN engine_entities e ON e.id = r.src_id "
+                "WHERE r.company_id = %s "
+                "AND (r.rel = 'approves' OR r.rel LIKE '%%approv%%')",
+                (company_id,),
+            )
+            return {row[0] for row in cur.fetchall() if row and row[0]}
+    except Exception:
+        return set()
+
+
+def _detect_act(conn, company_id, role, question, alias_map) -> dict | None:
+    """ACT detection, entirely from engine data signals.
+
+    Returns the ACT route dict, or None when the message is not an
+    action the engine can ground: no generic action verb, no
+    role-filtered covering facts for the topic, or no stored
+    approver entity mentioned in the message. Never raises.
+    """
+    try:
+        tokens = set(_TOKEN_RE.findall((question or "").lower()))
+        verbs = sorted(tokens & _ACTION_VERBS)
+        if not verbs:
+            return None
+        try:
+            found = retrieve.search(
+                conn, company_id, role, question, alias_map=alias_map
+            )
+            covering = retrieve.filter_covering(
+                found, question, alias_map=alias_map
+            )
+        except Exception:
+            return None
+        if not covering:
+            return None
+        candidates = _link_entities_by_token(conn, company_id, question)
+        approvers = _approver_entities(conn, company_id)
+        target = None
+        for candidate in candidates:
+            if candidate in approvers:
+                target = candidate
+                break
+        if target is None:
+            return None
+        topic = None
+        for candidate in candidates:
+            if candidate != target:
+                topic = candidate
+                break
+        if topic is None:
+            topic = "your request"
+        citations = []
+        try:
+            citations = engine_query._build_citations(covering, conn)
+        except Exception:
+            citations = []
+        signals = {
+            "action_verbs": verbs,
+            "entities_matched": candidates,
+            "target": target,
+            "topic": topic,
+            "covering_fact_count": len(covering),
+            "question_marker": _has_question_marker(question),
+            "word_count": _word_count(question),
+        }
+        return {
+            "answer": "",
+            "facts": covering,
+            "citations": citations,
+            "path": [],
+            "empty": False,
+            "source": "router",
+            "route": ACT,
+            "target_display": target,
+            "topic": topic,
+            "signals": signals,
+        }
+    except Exception:
+        return None
+
+
 def route_question(conn, company_id, role, question) -> dict:
     """Decide the route for one question, from engine data signals.
 
@@ -156,6 +331,15 @@ def route_question(conn, company_id, role, question) -> dict:
         alias_map = {}
     question_tokens = set(_TOKEN_RE.findall(question.lower()))
     expansions_used = sorted(t for t in alias_map if t in question_tokens)
+
+    # (0) ACT first: an action request grounded in engine data wins
+    # over answering — "inform HR about my reimbursement" is a
+    # request to do something, not a question to answer. A message
+    # that is not a grounded action falls through to the routes below.
+    act = _detect_act(conn, company_id, role, question, alias_map)
+    if act is not None:
+        _log.info("route=%s signals=%s", ACT, act["signals"])
+        return act
 
     entities_matched = []
     try:
@@ -308,6 +492,8 @@ def answer_question(conn, company_id, role, question) -> dict:
     the plain not-found text. LLM_DIRECT: a small-talk model reply
     that makes no factual claim, or "" when no key is set or the call
     fails (the caller then sends nothing rather than a fabrication).
+    ACT: returned as-is — the router decides, the caller executes
+    the action (app.actions) and produces the confirmation reply.
     """
     result = route_question(conn, company_id, role, question)
     if result["route"] == LLM_DIRECT:
