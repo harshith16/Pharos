@@ -327,7 +327,14 @@ def _clean_llm_entities(entries, text: str) -> list[dict]:
 
 
 def _extract_entities_deterministic(text: str) -> list[dict]:
-    """Capitalized word sequences + quoted strings, in text order."""
+    """Capitalized word sequences + quoted strings, in text order.
+
+    A single all-caps token in parentheses directly after a
+    capitalised word ("Sick Leave (SL)") is NOT an entity: it is the
+    short-form spelling of that name, and the alias learner
+    (extract_aliases) attaches it to the name's entity instead. Without
+    this, the short form would become a bogus standalone entity.
+    """
     candidates = []  # (start_offset, name)
     for match in _QUOTED_RE.finditer(text):
         inner = next(group for group in match.groups() if group is not None)
@@ -342,6 +349,18 @@ def _extract_entities_deterministic(text: str) -> list[dict]:
             continue
         if not tokens:
             continue
+        if (
+            len(tokens) == 1
+            and tokens[0].isupper()
+            and 2 <= len(tokens[0]) <= 6
+            and match.start() > 0
+            and text[match.start() - 1] == "("
+        ):
+            # Parenthesised short form after a capitalised word?
+            before = text[: match.start() - 1].rstrip()
+            prev_word = before.rsplit(" ", 1)[-1] if before else ""
+            if prev_word and prev_word[0].isupper():
+                continue
         candidates.append((match.start(), " ".join(tokens)))
     candidates.sort(key=lambda item: item[0])
     results = []
@@ -379,3 +398,79 @@ def extract_entities(text: str) -> list[dict]:
             return _extract_entities_deterministic(text)
         return _clean_llm_entities(entities, text)
     return _extract_entities_deterministic(text)
+
+
+# A parenthesised short form after a capitalised name: "Sick Leave
+# (SL)" teaches the engine that SL is that entity. The name is one or
+# more capitalised words; the short form is 2-6 capital letters or
+# digits. Sentence starters are excluded via the stopword filter on
+# the first word, and a short form equal to a word of the name itself
+# is not an alias.
+_ALIAS_RE = re.compile(
+    r"\b([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)*)\s*\(([A-Z0-9]{2,6})\)"
+)
+
+
+def extract_aliases(text: str) -> list[tuple]:
+    """(full name, short form) pairs learned from the text itself.
+
+    No hand-typed list exists anywhere: an abbreviation resolves only
+    when an upload wrote it in this form. Returns pairs in text order,
+    deduped. A name split across a chunk boundary is missed — the
+    200-character chunk overlap makes that rare, and a missed alias
+    only means that one upload's short form stays unresolved.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    out = []
+    seen = set()
+    for match in _ALIAS_RE.finditer(text):
+        name = re.sub(r"\s+", " ", match.group(1)).strip()
+        short = match.group(2)
+        if not name:
+            continue
+        if name.split(" ")[0].lower() in _STOPWORDS:
+            continue
+        if short.lower() in {w.lower() for w in name.split(" ")}:
+            continue
+        key = (normalize_name(name), short.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, short))
+    return out
+
+
+def add_alias(conn, company_id, entity_id, alias) -> bool:
+    """Attach a learned alias to an entity. Returns True when added.
+
+    No-ops when the alias is already attached (normalised compare) or
+    when it already belongs to a DIFFERENT entity (alias-collision
+    guard: one short form never points at two entities). Never
+    commits; the caller owns the transaction.
+    """
+    if not isinstance(alias, str) or not alias.strip():
+        return False
+    alias_norm = normalize_name(alias)
+    if not alias_norm:
+        return False
+    row = conn.execute(
+        "SELECT id, aliases FROM engine_entities "
+        "WHERE id = %s AND company_id = %s",
+        (entity_id, company_id),
+    ).fetchone()
+    if row is None:
+        return False
+    existing = row[1] or []
+    for current in existing:
+        if isinstance(current, str) and normalize_name(current) == alias_norm:
+            return False
+    other = _find_entity_row(conn, company_id, alias_norm)
+    if other is not None and str(other[0]) != str(entity_id):
+        return False
+    conn.execute(
+        "UPDATE engine_entities SET aliases = %s::jsonb, updated_at = now() "
+        "WHERE id = %s",
+        (json.dumps(list(existing) + [alias.strip()]), entity_id),
+    )
+    return True

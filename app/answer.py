@@ -91,10 +91,17 @@ def _template_fallback(current):
     return current[0]["fact"]
 
 
-def answer_question(conn, company_id, role, question):
-    current = retrieve.search(conn, company_id, role, question)
+def answer_question(conn, company_id, role, question, alias_map=None):
+    current = retrieve.search(
+        conn, company_id, role, question, alias_map=alias_map
+    )
+    # Uploaded-only gate: synthesis may use only facts that actually
+    # cover the question. A single weak fact (e.g. the frequency rule
+    # for "Rule for sl") must never become the answer.
+    current = retrieve.filter_covering(current, question, alias_map)
     all_rows = retrieve.search(
-        conn, company_id, role, question, include_superseded=True
+        conn, company_id, role, question, include_superseded=True,
+        alias_map=alias_map,
     )
     current_ids = {f["id"] for f in current}
     conflict_rows = [

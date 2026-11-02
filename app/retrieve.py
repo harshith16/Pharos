@@ -120,10 +120,78 @@ def _base_filter(include_superseded: bool, role: str) -> str:
 
 
 def _tokens(query: str) -> list:
+    # Words of length >= 2 are kept: short tokens can be abbreviations
+    # learned from uploads, and dropping them loses the question
+    # entirely (the old "Rule for sl" failure, where only "rule" was
+    # ever searched). Single letters are noise and stay dropped.
     return [
         t
         for t in _TOKEN_RE.findall(query.lower())
-        if len(t) >= 3 and t not in STOPWORDS
+        if len(t) >= 2 and t not in STOPWORDS
+    ]
+
+
+# Generic words that never count as coverage keys: they appear in
+# almost every policy question and would let any fact "cover" any
+# question (the frequency-rule failure: "rule" alone matched).
+_GENERIC_KEYS = {"rule", "rules"}
+
+
+# Query expansion comes from DATA, never from a hand-typed list: the
+# caller passes an alias map built from stored engine entities
+# (see app.engine.router.load_alias_map), mapping one alias token to
+# the entity's name tokens. No map means no expansion — an upload that
+# never taught an alias cannot be guessed at.
+def expand_tokens(tokens: list, alias_map: dict | None = None) -> list:
+    """Tokens plus alias expansions from stored entities, in order,
+    deduped. alias_map: {alias token: (name tokens, ...)}."""
+    out = list(tokens)
+    for tok in tokens:
+        for exp in (alias_map or {}).get(tok, ()):
+            if exp not in out:
+                out.append(exp)
+    return out
+
+
+def key_tokens(query: str, alias_map: dict | None = None) -> list:
+    """Coverage keys for a question: expanded tokens minus generics."""
+    return [
+        t
+        for t in expand_tokens(_tokens(query), alias_map)
+        if t not in _GENERIC_KEYS
+    ]
+
+
+def _entity_keys(tokens: list) -> set:
+    """Whole-name match keys: single tokens plus adjacent token pairs
+    joined with underscores, so 'travel policy' matches entity
+    'travel_policy' exactly. Never substrings: 'rule' must not match
+    'frequency_rule'."""
+    keys = set(tokens)
+    for a, b in zip(tokens, tokens[1:]):
+        keys.add(a + "_" + b)
+    return keys
+
+
+def fact_covers_question(
+    fact_text: str, question: str, alias_map: dict | None = None
+) -> bool:
+    """True when the fact text contains any coverage key as a whole word."""
+    keys = key_tokens(question, alias_map)
+    if not keys:
+        return False
+    words = set(_TOKEN_RE.findall((fact_text or "").lower()))
+    return any(k in words for k in keys)
+
+
+def filter_covering(
+    facts: list, question: str, alias_map: dict | None = None
+) -> list:
+    """Keep only facts whose text covers the question's key tokens."""
+    return [
+        f
+        for f in facts
+        if fact_covers_question(f.get("fact", ""), question, alias_map)
     ]
 
 
@@ -162,10 +230,14 @@ def _fetch_documents(conn, memory_ids):
     return docs
 
 
-def search(conn, company_id, role, query, include_superseded=False, limit=10):
+def search(
+    conn, company_id, role, query, include_superseded=False, limit=10,
+    alias_map=None,
+):
     """Candidate UNION of keyword, semantic and entity paths, then rank.
 
-    Ranking (mem0 score_and_rank shape): raw = semantic + bm25 + entity,
+    Ranking (mem0 score_and_rank shape): raw = semantic + keyword
+    (expanded-token match count, normalized) + entity,
     final = min(1, raw / max_possible), combined = final + recency
     - superseded_penalty (penalty only when include_superseded=True
     lets a superseded row through). Semantic signal below
@@ -175,22 +247,27 @@ def search(conn, company_id, role, query, include_superseded=False, limit=10):
     filt = _base_filter(include_superseded, role)
     # id (str) -> {"semantic": float, "keyword": float, "entity": bool}
     cand = {}
+    expanded = expand_tokens(_tokens(query), alias_map)
 
     with conn.cursor() as cur:
-        # (1) Keyword: Postgres full-text over the lemmatized text.
-        cur.execute(
-            "SELECT id, ts_rank_cd("
-            "  to_tsvector('simple', COALESCE(text_lemmatized, '')), "
-            "  plainto_tsquery('simple', %s)) AS rank "
-            "FROM memories "
-            f"WHERE {filt} "
-            "AND to_tsvector('simple', COALESCE(text_lemmatized, '')) "
-            "@@ plainto_tsquery('simple', %s)",
-            (query, company_id, query),
-        )
-        for mid, rank in cur.fetchall():
-            cand.setdefault(str(mid), {"semantic": 0.0, "keyword": 0.0, "entity": 0.0})
-            cand[str(mid)]["keyword"] = float(rank or 0.0)
+        # (1) Keyword: OR over expanded tokens — a fact matching ANY
+        # query word is a candidate. The old plainto_tsquery AND-match
+        # returned nothing for "Rule for sl": real SL facts don't
+        # contain the word "rule". Ranking by match count happens in
+        # Python below, from the lemmatized text.
+        if expanded:
+            tsquery = " | ".join(expanded)  # tokens are [a-z0-9]+ only
+            cur.execute(
+                "SELECT id FROM memories "
+                f"WHERE {filt} "
+                "AND to_tsvector('simple', COALESCE(text_lemmatized, '')) "
+                "@@ to_tsquery('simple', %s)",
+                (company_id, tsquery),
+            )
+            for (mid,) in cur.fetchall():
+                cand.setdefault(
+                    str(mid), {"semantic": 0.0, "keyword": 0.0, "entity": 0.0}
+                )
 
         # (2) Semantic, ONLY when vectors are actually available. This is
         # the PRIMARY path; keyword below is the always-on fallback.
@@ -223,13 +300,14 @@ def search(conn, company_id, role, query, include_superseded=False, limit=10):
         # to many memories is worth less than a rare one. Per memory,
         # boost = MAX over matched entities of
         #   sim * 0.5 * 1 / (1 + 0.001 * (n_linked - 1)^2)
-        # for matches with sim >= 0.5. sim = 1.0 on exact normalized
-        # equality, 0.75 on substring match.
-        tokens = _tokens(query)
-        if tokens:
+        # for matches with sim >= 0.5. sim = 1.0 on exact whole-name
+        # equality only — there is no substring tier, so "rule" never
+        # matches "frequency_rule". The ILIKE prefilter below only
+        # over-fetches candidates; the exact gate in Python decides.
+        if expanded:
             clauses = []
             params = [company_id]
-            for tok in tokens:
+            for tok in expanded:
                 clauses.append("(subject ILIKE %s OR object ILIKE %s)")
                 params.extend([f"%{tok}%", f"%{tok}%"])
             cur.execute(
@@ -240,21 +318,18 @@ def search(conn, company_id, role, query, include_superseded=False, limit=10):
             # entity key -> set of memory ids; (memory, entity) -> best sim
             entity_members = {}
             mem_entity_sim = {}
+            keys = _entity_keys(expanded)
             for mid, subject, obj in cur.fetchall():
                 for ent in (subject or "", obj or ""):
                     ent_norm = ent.lower()
-                    for tok in tokens:
-                        if tok == ent_norm:
-                            sim = 1.0
-                        elif tok in ent_norm or ent_norm in tok:
-                            sim = 0.75
-                        else:
-                            continue
-                        if sim < ENTITY_SIM_MIN:
-                            continue
-                        entity_members.setdefault(ent_norm, set()).add(str(mid))
-                        key = (str(mid), ent_norm)
-                        mem_entity_sim[key] = max(mem_entity_sim.get(key, 0.0), sim)
+                    if ent_norm not in keys:
+                        continue
+                    sim = 1.0
+                    if sim < ENTITY_SIM_MIN:
+                        continue
+                    entity_members.setdefault(ent_norm, set()).add(str(mid))
+                    key = (str(mid), ent_norm)
+                    mem_entity_sim[key] = max(mem_entity_sim.get(key, 0.0), sim)
             for (mid, ent_norm), sim in mem_entity_sim.items():
                 n_linked = len(entity_members.get(ent_norm, set()))
                 damped = sim * 0.5 * (1.0 / (1.0 + 0.001 * (n_linked - 1) ** 2))
@@ -272,7 +347,7 @@ def search(conn, company_id, role, query, include_superseded=False, limit=10):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id, fact, version, is_latest, status, effective_date, "
-            "visible_to, source, source_message_id FROM memories "
+            "visible_to, source, source_message_id, text_lemmatized FROM memories "
             f"WHERE id = ANY(%s::uuid[]) AND {filt}",
             (list(cand.keys()), company_id),
         )
@@ -281,6 +356,15 @@ def search(conn, company_id, role, query, include_superseded=False, limit=10):
 
     docs = _fetch_documents(conn, [r[0] for r in rows])
     today = date.today()
+    # Keyword score = how many expanded query tokens the fact's
+    # lemmatized text contains as whole words (OR-match ranking:
+    # more matched words outranks fewer).
+    for row in rows:
+        rec0 = dict(zip(cols, row))
+        lem_words = set(_TOKEN_RE.findall((rec0.get("text_lemmatized") or "").lower()))
+        cand[str(rec0["id"])]["keyword"] = float(
+            sum(1 for t in expanded if t in lem_words)
+        )
     max_rank = max((c["keyword"] for c in cand.values()), default=0.0)
     fetched = [cand[str(r[0])] for r in rows]
     any_bm25 = max_rank > 0
@@ -397,7 +481,9 @@ def get_memory(conn, memory_id):
     return _row_to_entry(rec, docs.get(str(rec["id"]), []))
 
 
-def search_as_of(conn, company_id, role, query, as_of, limit=10):
+def search_as_of(
+    conn, company_id, role, query, as_of, limit=10, alias_map=None
+):
     """What was true on date X: same candidate union as search(), but
     temporal filtering replaces the active-latest default.
 
@@ -417,20 +503,22 @@ def search_as_of(conn, company_id, role, query, as_of, limit=10):
         "AND (forget_after IS NULL OR forget_after > %s::date)"
     )
     cand = {}
+    expanded = expand_tokens(_tokens(query), alias_map)
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, ts_rank_cd("
-            "  to_tsvector('simple', COALESCE(text_lemmatized, '')), "
-            "  plainto_tsquery('simple', %s)) AS rank "
-            "FROM memories "
-            f"WHERE {filt} "
-            "AND to_tsvector('simple', COALESCE(text_lemmatized, '')) "
-            "@@ plainto_tsquery('simple', %s)",
-            (query, company_id, as_of, query),
-        )
-        for mid, rank in cur.fetchall():
-            cand.setdefault(str(mid), {"semantic": 0.0, "keyword": 0.0, "entity": 0.0})
-            cand[str(mid)]["keyword"] = float(rank or 0.0)
+        # Keyword: OR over expanded tokens (see search()).
+        if expanded:
+            tsquery = " | ".join(expanded)  # tokens are [a-z0-9]+ only
+            cur.execute(
+                "SELECT id FROM memories "
+                f"WHERE {filt} "
+                "AND to_tsvector('simple', COALESCE(text_lemmatized, '')) "
+                "@@ to_tsquery('simple', %s)",
+                (company_id, as_of, tsquery),
+            )
+            for (mid,) in cur.fetchall():
+                cand.setdefault(
+                    str(mid), {"semantic": 0.0, "keyword": 0.0, "entity": 0.0}
+                )
         query_vec = None
         try:
             if embed.vectors_available():
@@ -453,11 +541,10 @@ def search_as_of(conn, company_id, role, query, as_of, limit=10):
                     str(mid), {"semantic": 0.0, "keyword": 0.0, "entity": 0.0}
                 )
                 entry["semantic"] = max(0.0, 1.0 - float(dist))
-        tokens = _tokens(query)
-        if tokens:
+        if expanded:
             clauses = []
             params = [company_id]
-            for tok in tokens:
+            for tok in expanded:
                 clauses.append("(subject ILIKE %s OR object ILIKE %s)")
                 params.extend([f"%{tok}%", f"%{tok}%"])
             cur.execute(
@@ -467,21 +554,19 @@ def search_as_of(conn, company_id, role, query, as_of, limit=10):
             )
             entity_members = {}
             mem_entity_sim = {}
+            keys = _entity_keys(expanded)
             for mid, subject, obj in cur.fetchall():
                 for ent in (subject or "", obj or ""):
                     ent_norm = ent.lower()
-                    for tok in tokens:
-                        if tok == ent_norm:
-                            sim = 1.0
-                        elif tok in ent_norm or ent_norm in tok:
-                            sim = 0.75
-                        else:
-                            continue
-                        if sim < ENTITY_SIM_MIN:
-                            continue
-                        entity_members.setdefault(ent_norm, set()).add(str(mid))
-                        key = (str(mid), ent_norm)
-                        mem_entity_sim[key] = max(mem_entity_sim.get(key, 0.0), sim)
+                    # Whole-name match only (see search()).
+                    if ent_norm not in keys:
+                        continue
+                    sim = 1.0
+                    if sim < ENTITY_SIM_MIN:
+                        continue
+                    entity_members.setdefault(ent_norm, set()).add(str(mid))
+                    key = (str(mid), ent_norm)
+                    mem_entity_sim[key] = max(mem_entity_sim.get(key, 0.0), sim)
             for (mid, ent_norm), sim in mem_entity_sim.items():
                 n_linked = len(entity_members.get(ent_norm, set()))
                 damped = sim * 0.5 * (1.0 / (1.0 + 0.001 * (n_linked - 1) ** 2))
@@ -495,7 +580,7 @@ def search_as_of(conn, company_id, role, query, as_of, limit=10):
         cur.execute(
             "SELECT id, fact, version, is_latest, status, effective_date, "
             "visible_to, source, source_message_id, root_memory_id, "
-            "created_at FROM memories "
+            "created_at, text_lemmatized FROM memories "
             f"WHERE id = ANY(%s::uuid[]) AND {filt}",
             (list(cand.keys()), company_id, as_of),
         )
@@ -523,6 +608,14 @@ def search_as_of(conn, company_id, role, query, as_of, limit=10):
             families[family] = (sort_key, rec)
     winners = [rec for _, rec in families.values()]
     docs = _fetch_documents(conn, [r["id"] for r in winners])
+    # Keyword score = expanded-token match count (see search()).
+    for rec in winners:
+        lem_words = set(
+            _TOKEN_RE.findall((rec.get("text_lemmatized") or "").lower())
+        )
+        cand[str(rec["id"])]["keyword"] = float(
+            sum(1 for t in expanded if t in lem_words)
+        )
     max_rank = max((c["keyword"] for c in cand.values()), default=0.0)
     any_bm25 = max_rank > 0
     any_entity = any(cand[str(r["id"])]["entity"] > 0 for r in winners)

@@ -56,6 +56,30 @@ def _strip_code_fences(text: str) -> str:
     return stripped
 
 
+def _message_content(data) -> str | None:
+    """Message text from a chat-completion payload, or None.
+
+    A 200 response with null content is a real provider shape (seen
+    live on the small-talk path: "'NoneType' object has no attribute
+    'strip'"). Null, missing, or non-text content degrades to None
+    here — callers log it and reply nothing for that turn — instead
+    of crashing on .strip(). Never raises.
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+        choices = data.get("choices")
+        if not choices:
+            return None
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        return content if isinstance(content, str) else None
+    except Exception:
+        return None
+
+
 def chat_json(system: str, user: str, timeout: float = 60.0) -> dict:
     """POST an OpenAI-compatible chat completion and parse JSON content.
 
@@ -394,7 +418,15 @@ def generate_answer(message: str, context_facts: list | None = None) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        content = _message_content(data)
+        if not content or not content.strip():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "generate_answer returned no content; replying nothing"
+            )
+            return ""
+        return content.strip()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("generate_answer error: %s", exc)
@@ -440,7 +472,15 @@ def generate_doc_reply(filename: str, text: str | None, fact_count: int) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        content = _message_content(data)
+        if not content or not content.strip():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "generate_doc_reply returned no content; replying nothing"
+            )
+            return ""
+        return content.strip()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("generate_doc_reply error: %s", exc)
@@ -449,6 +489,66 @@ def generate_doc_reply(filename: str, text: str | None, fact_count: int) -> str:
 
 def reply_conversation(message: str) -> str:
     return generate_answer(message)
+
+
+def generate_smalltalk(message: str) -> str:
+    """Brief warm reply to an exact greeting/pleasantry.
+
+    Makes no factual claim: no company facts, no world facts, no
+    answers to questions — just a greeting back or an acknowledgment.
+    Returns "" when no key is set, the call fails, or the model
+    returns no content (a 200 with null content must never crash —
+    the caller then sends nothing rather than a fabricated reply).
+    """
+    key = _api_key().strip()
+    if not key:
+        return ""
+    url = _api_base().rstrip("/") + "/chat/completions"
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "model": _api_model(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a friendly WhatsApp assistant. The user "
+                            "just sent a short greeting or pleasantry. Reply "
+                            "briefly and warmly in 1-2 short sentences. Do not "
+                            "state any fact about any company, policy, person, "
+                            "place, or the world, and do not answer any "
+                            "question. Just greet back or acknowledge."
+                        ),
+                    },
+                    {"role": "user", "content": message},
+                ],
+                "max_tokens": 200,
+                "temperature": 0.7,
+            },
+            headers={
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+            },
+            timeout=30.0,
+            trust_env=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = _message_content(data)
+        if not content or not content.strip():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "generate_smalltalk returned no content; replying nothing"
+            )
+            return ""
+        return content.strip()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("generate_smalltalk error: %s", exc)
+        return ""
 
 
 def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str | None:
@@ -500,8 +600,15 @@ def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str |
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
-        return content or None
+        content = _message_content(data)
+        if not content or not content.strip():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "transcribe_image returned no content"
+            )
+            return None
+        return content.strip()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("transcribe_image error: %s", exc)

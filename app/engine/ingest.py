@@ -545,6 +545,61 @@ def _process_chunk(conn, company_id, chunk_text, entities_mod, relations_mod,
             relations_mod, conn, company_id, src_name, rel, dst_name)
         if existing is None:
             new_relations += 1
+    # Aliases learned from the content itself: "Sick Leave (SL)"
+    # teaches the engine that SL is the sick-leave entity. This is the
+    # ONLY way an abbreviation comes to resolve — there is no hand
+    # list. Alias learning never inflates the new-entity count, and a
+    # failure here never fails the upload: learning is additive.
+    # Collision fold: the short form may already exist as its own bare
+    # entity (an LLM extractor can return "SL" as an entity). A bare
+    # short-form node with no relations carries no graph information,
+    # so it is folded into the full-name entity — its name becomes the
+    # alias. A short form attached to a real, related entity is left
+    # alone: one short form never points at two entities.
+    extract_aliases = getattr(entities_mod, "extract_aliases", None)
+    add_alias = getattr(entities_mod, "add_alias", None)
+    merge_entities = getattr(entities_mod, "merge_entities", None)
+    get_entity = getattr(entities_mod, "get_entity", None)
+    norm_name = getattr(entities_mod, "normalize_name", None)
+    if callable(extract_aliases) and callable(add_alias):
+        for full_name, short in extract_aliases(chunk_text) or []:
+            try:
+                target_id, _counted = _resolve_and_count(
+                    entities_mod, conn, company_id,
+                    {"name": full_name, "display_name": full_name,
+                     "kind": "entity"},
+                    entity_ids, seen_entity_ids)
+                if not target_id:
+                    continue
+                if add_alias(conn, company_id, target_id, short):
+                    continue
+                if (
+                    callable(merge_entities)
+                    and callable(get_entity)
+                    and callable(norm_name)
+                ):
+                    other = get_entity(conn, company_id, short)
+                    if (
+                        other is not None
+                        and str(other.get("id")) != str(target_id)
+                        and norm_name(other.get("name") or "") == norm_name(short)
+                    ):
+                        rel_count = conn.execute(
+                            "SELECT COUNT(*) FROM engine_relations "
+                            "WHERE company_id = %s "
+                            "AND (src_id = %s OR dst_id = %s)",
+                            (company_id, other["id"], other["id"]),
+                        ).fetchone()[0]
+                        if rel_count == 0:
+                            merge_entities(
+                                conn, company_id, target_id, other["id"]
+                            )
+                            if str(other["id"]) in {
+                                str(v) for v in entity_ids.values()
+                            }:
+                                new_entities -= 1
+            except Exception:
+                continue
     return new_entities, new_relations
 
 

@@ -67,95 +67,58 @@ def _role_for(sender: str) -> str:
     return "employee"
 
 
-def _run_answer(company_id: str, role: str, question: str) -> str:
-    """Retrieve relevant context and get the raw response directly from Meta Model API.
+NOT_FOUND_REPLY = "I couldn't find that in the company documents."
+MEDIA_NOT_READ_REPLY = (
+    "I couldn't read that file — no text could be extracted from it. "
+    "Please send a clearer image or the document as text."
+)
 
-    No hardcoded greetings, no canned fallback messages, no preset answers.
-    Every answer is purely Meta Model API's raw response.
+
+def _media_reply(kind: str, filename: str, text, fact_count: int,
+                 engine_entities) -> str:
+    """Honest media confirmation; pure decision (no I/O) so tests can
+    call it directly.
+
+    No extractable text -> could-not-be-read, never silence, never a
+    success claim. An image whose ingest learned nothing (no facts,
+    no new entities) -> could-not-be-read. Otherwise the model
+    acknowledgment, or a plain saved confirmation when the model is
+    unavailable (no key) — never silence.
     """
-    from app.llm import generate_answer
-    from app import retrieve
+    if not text:
+        return MEDIA_NOT_READ_REPLY
+    if (
+        kind == "image"
+        and fact_count == 0
+        and (engine_entities is None or engine_entities == 0)
+    ):
+        return MEDIA_NOT_READ_REPLY
+    from app.llm import generate_doc_reply
 
-    context_facts = []
-    conn = None
-    ctx = None
     try:
-        from app.db import get_conn
-
-        candidate = get_conn()
-        if hasattr(candidate, "__enter__"):
-            ctx = candidate
-            conn = ctx.__enter__()
-        else:
-            conn = candidate
-
-        rows = retrieve.search(conn, company_id, role, question, limit=5)
-        doc_ids_all = set()
-        for r in rows:
-            for d in (r.get("document_ids") or []):
-                doc_ids_all.add(str(d))
-        doc_titles = {}
-        if doc_ids_all and hasattr(conn, "cursor"):
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, title FROM documents WHERE id = ANY(%s::uuid[])",
-                        (list(doc_ids_all),),
-                    )
-                    for did, dtitle in cur.fetchall():
-                        if dtitle:
-                            doc_titles[str(did)] = dtitle
-            except Exception:
-                pass
-
-        for r in rows:
-            scores = r.get("scores") or {}
-            sem = scores.get("semantic", 0.0)
-            kw = scores.get("keyword", 0.0)
-            ent = scores.get("entity", 0.0)
-            if sem >= 0.22 or kw > 0.05 or ent > 0:
-                dt = None
-                for did in (r.get("document_ids") or []):
-                    if str(did) in doc_titles:
-                        dt = doc_titles[str(did)]
-                        break
-                context_facts.append(
-                    {
-                        "fact": r["fact"],
-                        "effective_date": r.get("effective_date"),
-                        "source": r.get("source"),
-                        "doc_title": dt,
-                    }
-                )
+        reply = generate_doc_reply(filename, text, fact_count)
     except Exception:
-        context_facts = []
-    finally:
-        if ctx is not None:
-            ctx.__exit__(None, None, None)
-        elif conn is not None and hasattr(conn, "close"):
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    return generate_answer(question, context_facts=context_facts)
+        reply = ""
+    if reply and reply.strip():
+        return reply
+    return f"Got it — I've saved {filename}. You can ask me questions about it."
 
 
 def _answer_text(company_id: str, role: str, question: str) -> str:
-    """Engine-first WhatsApp text answer; "" when nothing answers.
+    """WhatsApp text answer, decided entirely by the engine router.
 
-    (1) The engine's multi-hop query (entities + relations, role
-    filter enforced), synthesized by the Meta LLM; its wrapper falls
-    back to legacy retrieval internally when the engine path fails
-    or is empty. Only a non-empty, non-canned result is returned.
-    (2) When both yield nothing, _run_answer (legacy retrieval +
-    general Meta chat) so casual messages still get a raw model reply.
-    (3) "" otherwise — the caller sends nothing and logs the failure.
-    Only the model's raw answer is ever returned; no canned text.
+    This layer makes no routing decision of its own: it opens a
+    connection, hands the question to the engine router, and returns
+    what the router decides — an engine answer from uploaded facts,
+    the plain not-found reply, or a small-talk model reply that makes
+    no factual claim. An empty router answer (e.g. a model failure on
+    the small-talk route) returns "" so the caller sends nothing.
+    Only the router's answer text is ever returned; no canned factual
+    text and no word list lives here.
     """
     try:
         from app.db import get_conn
-        from app.engine import query as engine_query
+        from app.engine import router as engine_router
 
         conn = None
         ctx = None
@@ -166,7 +129,7 @@ def _answer_text(company_id: str, role: str, question: str) -> str:
                 conn = ctx.__enter__()
             else:
                 conn = candidate
-            result = engine_query.answer_question_engine_or_legacy(
+            result = engine_router.answer_question(
                 conn, company_id, role, question
             )
         finally:
@@ -178,19 +141,11 @@ def _answer_text(company_id: str, role: str, question: str) -> str:
                 except Exception:
                     pass
         answer = result.get("answer") if isinstance(result, dict) else ""
-        if (
-            isinstance(result, dict)
-            and not result.get("empty")
-            and isinstance(answer, str)
-            and answer.strip()
-        ):
+        if isinstance(answer, str) and answer.strip():
             return answer
     except Exception:
         pass
-    try:
-        return _run_answer(company_id, role, question)
-    except Exception:
-        return ""
+    return ""
 
 
 def _safe_filename(name: str) -> str:
@@ -364,6 +319,7 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
             text = f"Caption: {caption}\n\nContent:\n{text}"
         else:
             text = f"Caption: {caption}"
+    engine_entities = None
     with get_conn() as conn:
         ingest_media(
             conn,
@@ -404,10 +360,12 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
             try:
                 from app.engine import ingest as engine_ingest
 
-                engine_ingest.ingest_text(
+                engine_result = engine_ingest.ingest_text(
                     conn, company_id, text, msg["filename"],
                     title=msg["filename"],
                 )
+                if isinstance(engine_result, dict):
+                    engine_entities = engine_result.get("entities")
             except Exception:
                 import logging
 
@@ -415,10 +373,10 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
                     "Engine ingest failed for WhatsApp media %s",
                     msg["filename"],
                 )
-    from app.llm import generate_doc_reply
-
     filename = msg["filename"]
-    return generate_doc_reply(filename, text, len(fact_ids))
+    return _media_reply(
+        msg["kind"], filename, text, len(fact_ids), engine_entities
+    )
 
 
 async def _deliver(client, phone_id: str, token: str, sender: str, body: str):
@@ -474,9 +432,10 @@ async def _handle_messages(messages: list) -> None:
     """Background worker: answer and deliver every parsed message.
 
     Runs after the webhook POST has returned 200, so a slow model or
-    Graph call can never stall the webhook. Every failure is logged
-    and that message is skipped — never an empty or canned send, and
-    never a claim about work that did not happen.
+    Graph call can never stall the webhook. Factual questions with no
+    covering uploaded facts get the plain not-found reply; a model
+    failure on small-talk sends nothing. Nothing is ever sent empty,
+    and never a claim about work that did not happen.
     """
     import logging
 

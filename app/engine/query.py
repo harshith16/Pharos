@@ -440,7 +440,7 @@ def _link_entities(conn, company_id, question) -> list:
     return out
 
 
-def answer_with_graph(conn, company_id, role, question) -> dict:
+def answer_with_graph(conn, company_id, role, question, alias_map=None) -> dict:
     """Answer a question from a role-filtered entity path.
 
     (1) Link known entities mentioned in the question (text extraction
@@ -507,9 +507,15 @@ def answer_with_graph(conn, company_id, role, question) -> dict:
                 has_key = False
             if has_key:
                 try:
-                    facts = retrieve.search(conn, company_id, role, question)
+                    facts = retrieve.search(
+                        conn, company_id, role, question, alias_map=alias_map
+                    )
                 except Exception:
                     facts = []
+                # Uploaded-only gate: synthesize only from facts that
+                # actually cover the question; otherwise fall through
+                # to the rendered path (real graph data, not synthesis).
+                facts = retrieve.filter_covering(facts, question, alias_map)
                 if facts:
                     try:
                         synthesis = llm.synthesize(question, facts, [])
@@ -537,7 +543,9 @@ def answer_with_graph(conn, company_id, role, question) -> dict:
         return _empty_result()
 
 
-def answer_question_engine_or_legacy(conn, company_id, role, question) -> dict:
+def answer_question_engine_or_legacy(
+    conn, company_id, role, question, alias_map=None
+) -> dict:
     """Engine first, legacy ``app.answer`` on any engine failure or empty.
 
     Engine success returns the engine result marked engine_fallback=False;
@@ -549,7 +557,9 @@ def answer_question_engine_or_legacy(conn, company_id, role, question) -> dict:
     """
     result = None
     try:
-        result = answer_with_graph(conn, company_id, role, question)
+        result = answer_with_graph(
+            conn, company_id, role, question, alias_map=alias_map
+        )
     except Exception:
         result = None
     if result is not None and not result.get("empty"):
@@ -557,7 +567,9 @@ def answer_question_engine_or_legacy(conn, company_id, role, question) -> dict:
         out["engine_fallback"] = False
         return out
     if _legacy_answer is not None:
-        legacy = _legacy_answer.answer_question(conn, company_id, role, question)
+        legacy = _legacy_answer.answer_question(
+            conn, company_id, role, question, alias_map=alias_map
+        )
         out = dict(legacy)
         out["engine_fallback"] = True
         return out
