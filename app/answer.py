@@ -93,6 +93,10 @@ def _template_fallback(current):
 
 def answer_question(conn, company_id, role, question):
     current = retrieve.search(conn, company_id, role, question)
+    # Uploaded-only gate: synthesis may use only facts that actually
+    # cover the question. A single weak fact (e.g. the frequency rule
+    # for "Rule for sl") must never become the answer.
+    current = retrieve.filter_covering(current, question)
     all_rows = retrieve.search(
         conn, company_id, role, question, include_superseded=True
     )

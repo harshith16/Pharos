@@ -510,6 +510,10 @@ def answer_with_graph(conn, company_id, role, question) -> dict:
                     facts = retrieve.search(conn, company_id, role, question)
                 except Exception:
                     facts = []
+                # Uploaded-only gate: synthesize only from facts that
+                # actually cover the question; otherwise fall through
+                # to the rendered path (real graph data, not synthesis).
+                facts = retrieve.filter_covering(facts, question)
                 if facts:
                     try:
                         synthesis = llm.synthesize(question, facts, [])

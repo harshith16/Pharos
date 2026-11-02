@@ -451,6 +451,57 @@ def reply_conversation(message: str) -> str:
     return generate_answer(message)
 
 
+def generate_smalltalk(message: str) -> str:
+    """Brief warm reply to an exact greeting/pleasantry.
+
+    Makes no factual claim: no company facts, no world facts, no
+    answers to questions — just a greeting back or an acknowledgment.
+    Returns "" when no key is set or the call fails (the caller then
+    sends nothing rather than a fabricated reply).
+    """
+    key = _api_key().strip()
+    if not key:
+        return ""
+    url = _api_base().rstrip("/") + "/chat/completions"
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "model": _api_model(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a friendly WhatsApp assistant. The user "
+                            "just sent a short greeting or pleasantry. Reply "
+                            "briefly and warmly in 1-2 short sentences. Do not "
+                            "state any fact about any company, policy, person, "
+                            "place, or the world, and do not answer any "
+                            "question. Just greet back or acknowledge."
+                        ),
+                    },
+                    {"role": "user", "content": message},
+                ],
+                "max_tokens": 200,
+                "temperature": 0.7,
+            },
+            headers={
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+            },
+            timeout=30.0,
+            trust_env=False,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("generate_smalltalk error: %s", exc)
+        return ""
+
+
 def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str | None:
     """Extract and transcribe all text, numbers, and information from image bytes using Meta Model API."""
     import base64
