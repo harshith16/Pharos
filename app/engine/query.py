@@ -184,14 +184,14 @@ def _load_role_filtered_edges(conn, company_id, role):
     Only engine_relations carries visible_to, so the bare whitelisted
     predicate resolves to that table's column. Endpoint entities are
     restricted to the same company. Returns rows of
-    (src_id, dst_id, rel, weight, src_display, dst_display).
+    (src_id, dst_id, rel, weight, src_display, dst_display, evidence).
     """
     predicate = _role_predicate(role)
     edges = []
     with conn.cursor() as cur:
         cur.execute(
             "SELECT r.src_id, r.dst_id, r.rel, r.weight, "
-            "s.name, s.display_name, d.name, d.display_name "
+            "s.name, s.display_name, d.name, d.display_name, r.evidence "
             "FROM engine_relations r "
             "JOIN engine_entities s ON s.id = r.src_id "
             "JOIN engine_entities d ON d.id = r.dst_id "
@@ -208,6 +208,7 @@ def _load_role_filtered_edges(conn, company_id, role):
             src_display = _row_value(row, 5, "display_name")
             dst_name = _row_value(row, 6, "name")
             dst_display = _row_value(row, 7, "display_name")
+            evidence = _row_value(row, 8, "evidence")
             if src_id is None or dst_id is None:
                 continue
             if not isinstance(rel, str) or not rel.strip():
@@ -232,25 +233,25 @@ def _load_role_filtered_edges(conn, company_id, role):
             )
             if src_shown is None or dst_shown is None:
                 continue
-            edges.append((src_id, dst_id, rel.strip(), score, src_shown, dst_shown))
+            edges.append((src_id, dst_id, rel.strip(), score, src_shown, dst_shown, evidence))
     return edges
 
 
 def _build_graph(conn, company_id, role):
     """Load the role-filtered graph: display names + adjacency.
 
-    Adjacency entries are (neighbor_id, relationship, weight, reversed):
+    Adjacency entries are (neighbor_id, relationship, weight, reversed, evidence):
     every stored edge is walkable in both directions, with the reverse
     direction flagged so rendering keeps the true edge direction.
     """
     entities, lookups = _load_entities(conn, company_id)
     edges = _load_role_filtered_edges(conn, company_id, role)
     adjacency = {}
-    for src_id, dst_id, rel, score, src_shown, dst_shown in edges:
+    for src_id, dst_id, rel, score, src_shown, dst_shown, evidence in edges:
         entities.setdefault(src_id, src_shown)
         entities.setdefault(dst_id, dst_shown)
-        adjacency.setdefault(src_id, []).append((dst_id, rel, score, False))
-        adjacency.setdefault(dst_id, []).append((src_id, rel, score, True))
+        adjacency.setdefault(src_id, []).append((dst_id, rel, score, False, evidence))
+        adjacency.setdefault(dst_id, []).append((src_id, rel, score, True, evidence))
     for neighbours in adjacency.values():
         neighbours.sort(key=lambda item: (entities.get(item[0], ""), item[1]))
     return entities, lookups, adjacency
@@ -269,7 +270,7 @@ def _enumerate_paths(entities, adjacency, start_id, target_id, max_hops):
         current, path, score, visited = stack.pop()
         if len(path) >= max_hops:
             continue
-        for neighbour, rel, weight, reversed_flag in adjacency.get(current, []):
+        for neighbour, rel, weight, reversed_flag, evidence in adjacency.get(current, []):
             if neighbour in visited:
                 continue
             step = {
@@ -277,6 +278,7 @@ def _enumerate_paths(entities, adjacency, start_id, target_id, max_hops):
                 "relationship": rel,
                 "to": entities.get(neighbour, ""),
                 "reversed": reversed_flag,
+                "evidence": evidence,
             }
             if not step["from"] or not step["to"]:
                 continue
@@ -412,13 +414,15 @@ def _link_entities(conn, company_id, question) -> list:
                 shown = name.strip()
             if not shown:
                 continue
-            forms = {shown}
+            forms = {shown, shown.replace("_", " ")}
             if isinstance(aliases, (list, tuple)):
                 for alias in aliases:
                     if isinstance(alias, str) and alias.strip():
                         forms.add(alias.strip())
+                        forms.add(alias.strip().replace("_", " "))
             elif isinstance(aliases, str) and aliases.strip():
                 forms.add(aliases.strip())
+                forms.add(aliases.strip().replace("_", " "))
             for form in forms:
                 pos = text.find(form.lower())
                 if pos >= 0:
@@ -460,10 +464,9 @@ def answer_with_graph(conn, company_id, role, question, alias_map=None) -> dict:
         except Exception:
             names = []
         if not names:
-            if _extract_entities is None:
-                return _empty_result()
             try:
-                raw_entities = _extract_entities(question)
+                from app.engine.entities import _extract_entities_deterministic
+                raw_entities = _extract_entities_deterministic(question)
             except Exception:
                 return _empty_result()
             if not raw_entities:
@@ -500,22 +503,52 @@ def answer_with_graph(conn, company_id, role, question, alias_map=None) -> dict:
         path = found["path"]
 
         facts = []
+        evidence_mids = []
+        for step in path:
+            ev = step.get("evidence")
+            if isinstance(ev, list):
+                evidence_mids.extend([str(m) for m in ev if m])
+        if evidence_mids:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT m.id, m.fact, m.version, m.is_latest, m.status, m.effective_date, m.visible_to, m.source, "
+                        "array_agg(ms.document_id) FILTER (WHERE ms.document_id IS NOT NULL) AS doc_ids "
+                        "FROM memories m "
+                        "LEFT JOIN memory_sources ms ON ms.memory_id = m.id "
+                        "WHERE m.id = ANY(%s::uuid[]) AND m.is_latest = true AND m.status = 'current' "
+                        "GROUP BY m.id",
+                        (evidence_mids,),
+                    )
+                    for mid, fact_text, ver, is_lat, stat, eff, vis, src, d_ids in cur.fetchall():
+                        facts.append({
+                            "id": str(mid),
+                            "fact": fact_text,
+                            "version": ver,
+                            "is_latest": is_lat,
+                            "status": stat,
+                            "effective_date": eff.isoformat() if eff else None,
+                            "visible_to": vis,
+                            "source": src,
+                            "document_ids": [str(d) for d in (d_ids or [])],
+                        })
+            except Exception:
+                facts = []
+
         if llm is not None:
             try:
                 has_key = llm.has_key()
             except Exception:
                 has_key = False
             if has_key:
-                try:
-                    facts = retrieve.search(
-                        conn, company_id, role, question, alias_map=alias_map
-                    )
-                except Exception:
-                    facts = []
-                # Uploaded-only gate: synthesize only from facts that
-                # actually cover the question; otherwise fall through
-                # to the rendered path (real graph data, not synthesis).
-                facts = retrieve.filter_covering(facts, question, alias_map)
+                if not facts:
+                    try:
+                        facts = retrieve.search(
+                            conn, company_id, role, question, alias_map=alias_map
+                        )
+                    except Exception:
+                        facts = []
+                    facts = retrieve.filter_covering(facts, question, alias_map)
                 if facts:
                     try:
                         synthesis = llm.synthesize(question, facts, [])
