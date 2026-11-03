@@ -202,6 +202,21 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             return security.CODE_LOCKED_REPLY
                         return security.CODE_INCORRECT_REPLY
                     # No pending question: fall through, treated normally.
+                # Conflict YES/NO: only when the message IS yes/no
+                # and a conflict is pending for this sender. Anything
+                # else routes normally and the pending conflict stays.
+                lowered = text.lower()
+                if lowered in ("yes", "no"):
+                    from app import conflicts as conflicts_mod
+
+                    resolved = conflicts_mod.resolve_conflict(
+                        company_id, sender, lowered == "yes"
+                    )
+                    if resolved is not None:
+                        reply, next_alert = resolved
+                        if next_alert:
+                            return f"{reply}\n\n{next_alert}"
+                        return reply
                 unlocked = security.is_unlocked(conn, sender, now)
                 result = None
                 with scoped_conn(role, unlocked=unlocked) as sconn:
@@ -432,6 +447,8 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
         else:
             text = f"Caption: {caption}"
     engine_entities = None
+    conflict_alert = None
+    conflict_queued = 0
     with scoped_conn("ceo", unlocked=True) as conn:
         ingest_media(
             conn,
@@ -451,41 +468,64 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
                 msg["filename"],
                 text,
             )
+            # Conflict check BEFORE storing: facts that contradict
+            # a stored fact are held (app.conflicts), never stored,
+            # until the uploader replies YES/NO. Engine ingest is
+            # skipped while anything is held, so held content
+            # cannot answer questions before YES.
             try:
-                from app.llm import extract_and_store
+                from app import conflicts as conflicts_mod
+                from app.llm import extract_facts
 
-                fact_ids = extract_and_store(
-                    conn,
-                    company_id,
-                    text,
-                    "image" if msg["kind"] == "image" else "document",
-                    document_id=doc_id,
+                facts = extract_facts(text)
+                fact_ids, conflict_alert, conflict_queued = (
+                    conflicts_mod.store_facts_checked(
+                        conn,
+                        company_id,
+                        msg["sender"],
+                        text,
+                        msg["filename"],
+                        doc_id,
+                        "image" if msg["kind"] == "image" else "document",
+                        facts,
+                    )
                 )
             except Exception:
                 fact_ids = []
-            # Engine ingest (dual-write): the same content becomes
-            # part of the interconnected graph — chunked ingest,
-            # entity extraction, relation building, content-hash
-            # dedup — so WhatsApp questions answer from the graph.
-            # A failure here is logged only; the legacy ingest above
-            # already stands, so the upload still answers via fallback.
-            try:
-                from app.engine import ingest as engine_ingest
+                conflict_alert = None
+                conflict_queued = 0
+            if conflict_alert is None and conflict_queued == 0:
+                # Engine ingest (dual-write): the same content becomes
+                # part of the interconnected graph — chunked ingest,
+                # entity extraction, relation building, content-hash
+                # dedup — so WhatsApp questions answer from the graph.
+                # A failure here is logged only; the legacy ingest above
+                # already stands, so the upload still answers via fallback.
+                try:
+                    from app.engine import ingest as engine_ingest
 
-                engine_result = engine_ingest.ingest_text(
-                    conn, company_id, text, msg["filename"],
-                    title=msg["filename"],
-                )
-                if isinstance(engine_result, dict):
-                    engine_entities = engine_result.get("entities")
-            except Exception:
-                import logging
+                    engine_result = engine_ingest.ingest_text(
+                        conn, company_id, text, msg["filename"],
+                        title=msg["filename"],
+                    )
+                    if isinstance(engine_result, dict):
+                        engine_entities = engine_result.get("entities")
+                except Exception:
+                    import logging
 
-                logging.getLogger("whatsapp_webhook").exception(
-                    "Engine ingest failed for WhatsApp media %s",
-                    msg["filename"],
-                )
+                    logging.getLogger("whatsapp_webhook").exception(
+                        "Engine ingest failed for WhatsApp media %s",
+                        msg["filename"],
+                    )
     filename = msg["filename"]
+    if conflict_alert:
+        return conflict_alert
+    if conflict_queued:
+        return (
+            f"Saved {filename}. Another conflict is already waiting "
+            "for your YES/NO, so this one is queued — I'll show it "
+            "after you resolve the first."
+        )
     return _media_reply(
         msg["kind"], filename, text, len(fact_ids), engine_entities
     )
