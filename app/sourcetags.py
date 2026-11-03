@@ -81,9 +81,10 @@ def source_lines(conn, company_id: str, facts):
 
 
 def tag_answer(conn, company_id: str, answer: str, facts) -> str:
-    """Append a Sources block to a factual answer, or return the
-    answer unchanged when no source lines can be built."""
+    """Put source document, date, and (current)/(superseded) tag on the same lines as the answer."""
     lines = source_lines(conn, company_id, facts)
     if not lines:
         return answer
-    return answer.rstrip() + "\n\nSources:\n" + "\n".join(lines)
+    clean_lines = [l.lstrip("• ").strip() for l in lines]
+    src_str = "Sources: " + "; ".join(clean_lines[:2])
+    return f"{answer.rstrip()}\n{src_str}"

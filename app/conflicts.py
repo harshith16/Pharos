@@ -158,24 +158,27 @@ def old_fact_citation(conn, memory_id: str):
     return (doc, date_str)
 
 
-def format_alert(new_fact: str, doc_label: str, date_str: str, old_fact: str) -> str:
-    """The exact founder shape for a pending conflict."""
-    return (
-        f"New doc says {_clean_fact_text(new_fact)}. "
-        f"Stored fact ({doc_label}, {date_str}) says "
-        f"{_clean_fact_text(old_fact)}. Replace? Reply YES/NO."
-    )
+def format_alert(new_fact: str, doc_label: str, date_str: str, old_fact: str,
+                 new_doc: str = "", new_date: str = "") -> str:
+    """Show both values with their source documents and dates, and ask which is correct (at most 4 lines)."""
+    d1 = f"Doc 1 ({doc_label}, {date_str}): {_clean_fact_text(old_fact)}"
+    new_doc_label = new_doc or "New doc"
+    new_date_label = new_date or "recent"
+    d2 = f"Doc 2 ({new_doc_label}, {new_date_label}): {_clean_fact_text(new_fact)}"
+    return f"{d1}\n{d2}\nDo you know which is correct?"
 
 
 def _alert_for_row(conn, row) -> str:
     """Alert text for a pending_conflicts row tuple."""
     _id, old_id, new_fact = row[0], row[1], row[2]
+    new_doc = row[3] if len(row) > 3 and row[3] else ""
+    new_date = str(row[4]) if len(row) > 4 and row[4] else ""
     old = conn.execute(
         "SELECT fact FROM memories WHERE id = %s", (old_id,)
     ).fetchone()
     old_fact = old[0] if old else ""
     doc_label, date_str = old_fact_citation(conn, old_id)
-    return format_alert(new_fact, doc_label, date_str, old_fact)
+    return format_alert(new_fact, doc_label, date_str, old_fact, new_doc=new_doc, new_date=new_date)
 
 
 def store_facts_checked(conn, company_id: str, sender: str, doc_text: str,
@@ -263,13 +266,121 @@ def store_facts_checked(conn, company_id: str, sender: str, doc_text: str,
         )
         if status == "pending":
             doc_label, date_str = old_fact_citation(conn, old["memory_id"])
+            new_date = str(fact.get("effective_date") or "")
             alert = format_alert(
-                fact.get("fact"), doc_label, date_str, old["fact"]
+                fact.get("fact"), doc_label, date_str, old["fact"],
+                new_doc=filename, new_date=new_date,
             )
         else:
             queued += 1
     conn.commit()
     return stored_ids, alert, queued
+
+
+def has_pending_conflict(conn, company_id: str, sender: str) -> bool:
+    """Check if the sender has an active pending conflict awaiting resolution."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM pending_conflicts WHERE company_id = %s "
+            "AND sender = %s AND status = 'pending'",
+            (company_id, sender),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def handle_conflict_unknown(company_id: str, sender: str) -> str:
+    """Handle when uploader replies 'I don't know' / 'not sure' to a conflict alert.
+
+    Do not discard anything and do not guess. Reply saying we will ping the right person,
+    then ping the relevant approver chosen from approver information in uploaded documents
+    themselves, never from a hardcoded list. Keep the conflict open until a human resolves it.
+    """
+    with scoped_conn("ceo", unlocked=True) as conn:
+        row = conn.execute(
+            "SELECT id, old_memory_id, new_fact, new_filename "
+            "FROM pending_conflicts WHERE company_id = %s AND sender = %s "
+            "AND status = 'pending' ORDER BY created_at LIMIT 1",
+            (company_id, sender),
+        ).fetchone()
+        if not row:
+            return "No conflict is currently pending."
+        pid, old_id, new_fact, new_filename = row
+
+        # Search stored facts in company documents for approvers/leads/managers
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fact FROM memories WHERE company_id = %s AND status = 'current'",
+            (company_id,),
+        )
+        facts = [r[0] for r in cur.fetchall()]
+
+        lower_fact = (new_fact or "").lower()
+        topic = "general"
+        approver_role = "ceo"
+        approver_title = None
+
+        if any(w in lower_fact for w in ["salary", "leave", "travel", "training", "resignation", "notice", "handover", "holiday", "medical"]):
+            topic = "HR"
+            approver_role = "hr"
+            for f in facts:
+                if "hr lead" in f.lower() or "hr manager" in f.lower():
+                    approver_title = "HR Lead"
+                    break
+            if not approver_title:
+                for f in facts:
+                    if "reporting manager" in f.lower() or "manager" in f.lower():
+                        approver_title = "Reporting Manager"
+                        break
+        elif any(w in lower_fact for w in ["budget", "reimbursement", "expense", "cost", "finance", "accounts"]):
+            topic = "Finance"
+            approver_role = "cfo"
+            for f in facts:
+                if "cfo" in f.lower() or "finance manager" in f.lower():
+                    approver_title = "Finance Manager"
+                    break
+
+        if not approver_title and facts:
+            for f in facts:
+                m = re.search(r"approval from (?:the )?([A-Za-z ]+?)(?: before|\.|\,)", f, re.IGNORECASE)
+                if m:
+                    approver_title = m.group(1).strip()
+                    break
+
+        _log.info(
+            "conflict_unknown company=%s sender=%s topic=%s approver=%s",
+            company_id, sender, topic, approver_title or "none",
+        )
+
+        if not approver_title:
+            return (
+                "Alright, I'll ping the right person about this.\n"
+                "No approver was found in company documents."
+            )
+
+        from app.roleblock import approver_phone, send_access_message
+        phone = approver_phone(approver_role)
+        if not phone:
+            _log.info("Approver %s identified from docs, but no phone configured", approver_title)
+            return (
+                "Alright, I'll ping the right person about this.\n"
+                f"Found approver {approver_title}, but no phone number is configured."
+            )
+
+        body = f"Conflict notice: Discrepancy between company documents regarding {topic}. Please review."
+        ok, detail = send_access_message(phone, body)
+        _log.info("Pinged approver %s at %s (ok=%s, detail=%s)", approver_title, phone, ok, detail)
+        if ok:
+            return (
+                "Alright, I'll ping the right person about this.\n"
+                f"Pinged {approver_title} at {phone} about this conflict."
+            )
+        else:
+            return (
+                "Alright, I'll ping the right person about this.\n"
+                f"Found {approver_title}, but message send returned {detail}."
+            )
 
 
 def resolve_conflict(company_id: str, sender: str, yes: bool):
@@ -364,7 +475,7 @@ def resolve_conflict(company_id: str, sender: str, yes: bool):
         # Promote the oldest queued conflict, if any.
         next_alert = None
         nxt = conn.execute(
-            "SELECT id, old_memory_id, new_fact FROM pending_conflicts "
+            "SELECT id, old_memory_id, new_fact, new_filename, new_effective_date FROM pending_conflicts "
             "WHERE company_id = %s AND sender = %s AND status = 'queued' "
             "ORDER BY created_at LIMIT 1",
             (company_id, sender),

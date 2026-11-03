@@ -46,7 +46,7 @@ exception.
 import logging
 import re
 
-from app import retrieve
+from app import config, retrieve
 from app.engine import query as engine_query
 
 try:  # Legacy answer path, used only for the ENGINE route's facts.
@@ -312,6 +312,46 @@ def _detect_act(conn, company_id, role, question, alias_map) -> dict | None:
         return None
 
 
+def is_intro_query(question: str) -> bool:
+    """True when the user sends a greeting or asks about the agent's capabilities."""
+    cleaned = re.sub(r"[^\w\s]", "", (question or "").lower()).strip()
+    if not cleaned:
+        return True
+    exacts = {
+        "hi", "hello", "hey", "help", "who are you",
+        "what can you do", "hi what can you do", "hello what can you do",
+        "hey what can you do"
+    }
+    if cleaned in exacts:
+        return True
+    if "what can you do" in cleaned or "who are you" in cleaned:
+        return True
+    if cleaned.startswith("hi ") or cleaned.startswith("hello ") or cleaned.startswith("hey "):
+        sub = cleaned.split(maxsplit=1)[1].strip()
+        if sub in exacts or "what can you do" in sub or "who are you" in sub:
+            return True
+    return False
+
+
+def has_open_conflict(conn, company_id: str, facts: list) -> bool:
+    """Check if any covering fact has an open conflict waiting in pending_conflicts."""
+    if not facts or conn is None:
+        return False
+    try:
+        fids = [f["id"] for f in facts if isinstance(f, dict) and f.get("id")]
+        if not fids:
+            return False
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pending_conflicts WHERE company_id = %s "
+                "AND old_memory_id = ANY(%s::uuid[]) AND status = 'pending'",
+                (company_id, fids),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def route_question(conn, company_id, role, question) -> dict:
     """Decide the route for one question, from engine data signals.
 
@@ -456,58 +496,84 @@ def route_question(conn, company_id, role, question) -> dict:
         _log.info("route=%s signals=%s", ENGINE, signals)
         return out
 
-    # (3) No coverage anywhere: factual shape -> NOT_FOUND, short
-    # non-question utterance -> LLM_DIRECT.
-    if _has_question_marker(question) or _word_count(question) >= 3:
+    # (3) No coverage anywhere:
+    if is_intro_query(question):
         out = {
-            "answer": NOT_FOUND_REPLY,
+            "answer": config.intro_message(),
             "facts": [],
             "citations": [],
             "path": [],
-            "empty": True,
+            "empty": False,
             "source": "router",
-            "route": NOT_FOUND,
+            "route": LLM_DIRECT,
             "signals": signals,
         }
-        _log.info("route=%s signals=%s", NOT_FOUND, signals)
+        _log.info("route=%s signals=%s", LLM_DIRECT, signals)
         return out
+
+    # Otherwise, it has no coverage in company documents:
+    # Always return exactly "Not found in company documents." - no guessing, no general knowledge.
     out = {
-        "answer": "",
+        "answer": NOT_FOUND_REPLY,
         "facts": [],
         "citations": [],
         "path": [],
         "empty": True,
         "source": "router",
-        "route": LLM_DIRECT,
+        "route": NOT_FOUND,
         "signals": signals,
     }
-    _log.info("route=%s signals=%s", LLM_DIRECT, signals)
+    _log.info("route=%s signals=%s", NOT_FOUND, signals)
     return out
 
 
 def answer_question(conn, company_id, role, question) -> dict:
     """Route a question and produce the reply text for its route.
 
-    ENGINE: the engine/legacy answer (facts + evidence). NOT_FOUND:
-    the plain not-found text. LLM_DIRECT: a small-talk model reply
-    that makes no factual claim, or "" when no key is set or the call
-    fails (the caller then sends nothing rather than a fabrication).
-    ACT: returned as-is — the router decides, the caller executes
-    the action (app.actions) and produces the confirmation reply.
+    ENGINE: the engine/legacy answer (facts + evidence).
+    NOT_FOUND: exactly 'Not found in company documents.'
+    LLM_DIRECT: configured agent intro listing capabilities, no company facts.
+    ACT: returned as-is for actions execution.
     """
+    if is_intro_query(question):
+        signals = {
+            "entities_matched": [],
+            "covering_fact_count": 0,
+            "engine_path": False,
+            "engine_path_hops": 0,
+            "role_blocked": False,
+            "freshness": None,
+            "question_marker": False,
+            "word_count": _word_count(question),
+            "alias_expansions_used": [],
+        }
+        return {
+            "answer": config.intro_message(),
+            "facts": [],
+            "citations": [],
+            "path": [],
+            "empty": False,
+            "source": "router",
+            "route": LLM_DIRECT,
+            "signals": signals,
+        }
+
     result = route_question(conn, company_id, role, question)
     if result["route"] == LLM_DIRECT:
-        reply = ""
-        if llm is not None:
-            try:
-                reply = llm.generate_smalltalk(question) or ""
-            except Exception:
-                reply = ""
         out = dict(result)
-        out["answer"] = reply
-        out["empty"] = not bool(reply.strip())
+        out["answer"] = config.intro_message()
+        out["empty"] = False
         return out
     if result["route"] == ENGINE:
+        # A fact with an open conflict must NOT be used to answer silently.
+        if has_open_conflict(conn, company_id, result.get("facts") or []):
+            out = dict(result)
+            out["answer"] = (
+                "There is an open conflict on this topic in your documents.\n"
+                "Please resolve the conflict before querying."
+            )
+            return out
+
         # As-of questions get the deterministic version-chain
         # answer (both values with source tags) instead of a
         # synthesis that might mention only one version. No key

@@ -50,26 +50,46 @@ def _normalize(vec: list) -> list:
     return [x / norm for x in vec]
 
 
-def vectors_available(timeout: float = 2.0) -> bool:
+import time
+
+_client = None
+
+
+def _get_client() -> httpx.Client:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.Client(trust_env=False)
+    return _client
+
+
+_AVAIL_CACHE = {"status": False, "checked_at": 0.0}
+_AVAIL_TTL = 30.0  # Cache availability for 30s instead of pinging /api/tags every query
+
+
+def vectors_available(timeout: float = 2.0, force: bool = False) -> bool:
     """True only if Ollama is reachable AND the embed model is installed.
 
-    Cheap live check (no cache) so the app picks up Ollama if it starts
-    later, and drops vectors cleanly if it goes away.
+    Cached with a 30s TTL to prevent massive multi-second delay on every retrieval step.
     """
+    now = time.time()
+    if not force and (now - _AVAIL_CACHE["checked_at"]) < _AVAIL_TTL:
+        return _AVAIL_CACHE["status"]
+
     try:
-        # trust_env=False: localhost must never go through an env proxy.
-        # (Sandbox proxy env mangles localhost URLs; direct is correct here.)
-        resp = httpx.get(
-            f"{config.OLLAMA_URL}/api/tags", timeout=timeout, trust_env=False
-        )
+        client = _get_client()
+        resp = client.get(f"{config.OLLAMA_URL}/api/tags", timeout=timeout)
         resp.raise_for_status()
         models = [m.get("name", "") for m in resp.json().get("models", [])]
-        return any(
+        status = any(
             m == config.EMBED_MODEL or m.startswith(config.EMBED_MODEL + ":")
             for m in models
         )
     except Exception:
-        return False
+        status = False
+
+    _AVAIL_CACHE["status"] = status
+    _AVAIL_CACHE["checked_at"] = now
+    return status
 
 
 def embed(text: str, timeout: float = 60.0) -> list | None:
@@ -79,11 +99,11 @@ def embed(text: str, timeout: float = 60.0) -> list | None:
     ValueError is the one exception, by design (callers must chunk)."""
     _check_budget(text)
     try:
-        resp = httpx.post(
+        client = _get_client()
+        resp = client.post(
             f"{config.OLLAMA_URL}/api/embeddings",
             json={"model": config.EMBED_MODEL, "prompt": text},
             timeout=timeout,
-            trust_env=False,
         )
         resp.raise_for_status()
         vec = resp.json()["embedding"]
@@ -105,5 +125,17 @@ def embed_document(title: str, text: str) -> list | None:
     return embed(document_text(title, text))
 
 
+_QUERY_CACHE: dict[str, list] = {}
+
+
 def embed_query(query: str) -> list | None:
-    return embed(query_text(query))
+    """Embed a query text with in-memory caching to avoid duplicate embeddings
+    for the same question in router, retrieval, and sensitive checking."""
+    if query in _QUERY_CACHE:
+        return _QUERY_CACHE[query]
+    vec = embed(query_text(query))
+    if vec is not None:
+        if len(_QUERY_CACHE) > 200:
+            _QUERY_CACHE.clear()
+        _QUERY_CACHE[query] = vec
+    return vec

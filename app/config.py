@@ -17,18 +17,18 @@ _LOADED_ENV_PATH = None
 try:
     from dotenv import load_dotenv
 
-    # Explicit path to repo-root .env with override=False
+    # Explicit path to repo-root .env with override=True
     if _REPO_ROOT_ENV.is_file():
-        load_dotenv(dotenv_path=_REPO_ROOT_ENV, override=False)
+        load_dotenv(dotenv_path=_REPO_ROOT_ENV, override=True)
         _LOADED_ENV_PATH = str(_REPO_ROOT_ENV.resolve())
     else:
         # Fallback to working directory lookup only if repo-root file does not exist
         _cwd_env = Path.cwd() / ".env"
         if _cwd_env.is_file():
-            load_dotenv(dotenv_path=_cwd_env, override=False)
+            load_dotenv(dotenv_path=_cwd_env, override=True)
             _LOADED_ENV_PATH = str(_cwd_env.resolve())
         else:
-            load_dotenv(override=False)
+            load_dotenv(override=True)
 
     if _LOADED_ENV_PATH:
         logger.info("Loaded .env from: %s", _LOADED_ENV_PATH)
@@ -60,7 +60,23 @@ _DEFAULTS = {
     "WHATSAPP_MANAGER_PHONE": "",
     "COMPANY_ID": "sample-company",
     "MEDIA_DIR": "./media",
+    "AGENT_NAME": "Pharos",
 }
+
+
+def agent_name() -> str:
+    """The agent's name lives in exactly ONE configurable place."""
+    return get("AGENT_NAME", "Pharos")
+
+
+def intro_message() -> str:
+    """Introductory capabilities reply using the single configured name."""
+    name = agent_name()
+    return (
+        f"Hi, I'm {name}, your corporate agent.\n"
+        "I can answer questions from your company documents, including reimbursement and anything else in them.\n"
+        "I can flag when documents disagree, and I can ping HR or the right employee about an issue."
+    )
 
 
 def get(name: str, default: str = "") -> str:

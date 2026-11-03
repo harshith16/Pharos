@@ -76,18 +76,30 @@ MEDIA_NOT_READ_REPLY = (
 )
 
 
+DOC_READ_SUCCESS_REPLY = (
+    "I've read the document.\n"
+    "You can ask questions about it now."
+)
+
+
+def clamp_reply_lines(text: str, max_lines: int = 4) -> str:
+    """Ensure every WhatsApp reply is at most max_lines lines."""
+    if not text:
+        return text
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[:max_lines])
+
+
 def _media_reply(kind: str, filename: str, text, fact_count: int,
                  engine_entities) -> str:
-    """Honest media confirmation; pure decision (no I/O) so tests can
-    call it directly.
+    """Honest media confirmation.
 
-    No extractable text -> could-not-be-read, never silence, never a
-    success claim. An image whose ingest learned nothing (no facts,
-    no new entities) -> could-not-be-read. Otherwise the model
-    acknowledgment, or a plain saved confirmation when the model is
-    unavailable (no key) — never silence.
+    No extractable text -> failure message, never an acknowledgement.
+    Successful read -> exact "I've read the document. You can ask questions about it now."
     """
-    if not text:
+    if not text or not str(text).strip():
         return MEDIA_NOT_READ_REPLY
     if (
         kind == "image"
@@ -95,15 +107,7 @@ def _media_reply(kind: str, filename: str, text, fact_count: int,
         and (engine_entities is None or engine_entities == 0)
     ):
         return MEDIA_NOT_READ_REPLY
-    from app.llm import generate_doc_reply
-
-    try:
-        reply = generate_doc_reply(filename, text, fact_count)
-    except Exception:
-        reply = ""
-    if reply and reply.strip():
-        return reply
-    return f"Got it — I've saved {filename}. You can ask me questions about it."
+    return DOC_READ_SUCCESS_REPLY
 
 
 def _route_on_scoped(company_id: str, role: str, question: str,
@@ -208,20 +212,25 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                 # and a conflict is pending for this sender. Anything
                 # else routes normally and the pending conflict stays.
                 lowered = text.lower()
-                if lowered in ("yes", "no"):
-                    from app import conflicts as conflicts_mod
+                from app import conflicts as conflicts_mod
+                if conflicts_mod.has_pending_conflict(conn, company_id, sender):
+                    unknown_phrases = ["don't know", "dont know", "not sure", "no idea", "unsure", "do not know"]
+                    if any(p in lowered for p in unknown_phrases):
+                        return conflicts_mod.handle_conflict_unknown(company_id, sender)
 
-                    resolved = conflicts_mod.resolve_conflict(
-                        company_id, sender, lowered == "yes"
-                    )
-                    if resolved is not None:
-                        reply, next_alert = resolved
-                        if next_alert:
-                            return f"{reply}\n\n{next_alert}"
-                        return reply
-                    # Access request second: a YES/NO with only an
-                    # access request pending resolves that; with
-                    # neither pending it routes normally below.
+                    yes_words = {"yes", "y", "doc 2", "second", "new", "replace", "2"}
+                    no_words = {"no", "n", "doc 1", "first", "old", "keep", "1"}
+                    if lowered in yes_words or any(w in lowered for w in ["confirm new", "doc 2", "replace"]):
+                        resolved = conflicts_mod.resolve_conflict(company_id, sender, yes=True)
+                        if resolved is not None:
+                            reply, next_alert = resolved
+                            return f"{reply}\n\n{next_alert}" if next_alert else reply
+                    elif lowered in no_words or any(w in lowered for w in ["keep old", "doc 1", "keep"]):
+                        resolved = conflicts_mod.resolve_conflict(company_id, sender, yes=False)
+                        if resolved is not None:
+                            reply, next_alert = resolved
+                            return f"{reply}\n\n{next_alert}" if next_alert else reply
+                elif lowered in ("yes", "no"):
                     from app import roleblock as roleblock_mod
 
                     access_reply = roleblock_mod.resolve_access_request(
@@ -295,8 +304,9 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
         answer = result.get("answer") if isinstance(result, dict) else ""
         if isinstance(answer, str) and answer.strip():
             return answer
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("whatsapp_webhook").exception("Error in _answer_text: %s", exc)
     return ""
 
 
@@ -675,11 +685,12 @@ async def _handle_messages(messages: list) -> None:
                 _log.exception("Media processing failed: %s", exc)
                 continue
         if not reply or not reply.strip():
-            _log.error(
-                "Model produced no reply for message from %s; nothing sent",
+            _log.warning(
+                "Model produced no reply for message from %s; sending fallback",
                 sender,
             )
-            continue
+            reply = NOT_FOUND_REPLY
+        reply = clamp_reply_lines(reply, max_lines=4)
         recipient_to_use = sender
         test_recip = config.WHATSAPP_TEST_RECIPIENT
         if test_recip and (
@@ -700,7 +711,7 @@ async def _handle_messages(messages: list) -> None:
                 kind, detail = await _deliver(
                     client, phone_id, token, test_recip, reply
                 )
-        _log.info("Delivery result for %s: kind=%s", recipient_to_use, kind)
+        _log.info("Delivery result for %s: kind=%s, detail=%s", recipient_to_use, kind, detail)
 
 
 @router.post("/webhook/whatsapp")

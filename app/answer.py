@@ -13,7 +13,7 @@ try:  # app.llm built in parallel; absence -> template fallback, not a crash.
 except ImportError:  # pragma: no cover - parallel-build tolerance
     llm = None
 
-EMPTY_ANSWER = "I couldn't find a matching policy for that question."
+EMPTY_ANSWER = "Not found in company documents."
 
 
 def _build_citations(current, doc_titles=None):
@@ -126,6 +126,7 @@ def answer_question(conn, company_id, role, question, alias_map=None):
             answer = llm.synthesize(question, current, conflict_rows)
         except Exception:
             answer = None
+
     else:
         answer = _template_fallback(current)
 

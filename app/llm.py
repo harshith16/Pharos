@@ -128,6 +128,16 @@ def _message_content(data) -> str | None:
         return None
 
 
+_http_client = None
+
+
+def _get_http_client() -> httpx.Client:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.Client(trust_env=False)
+    return _http_client
+
+
 def chat_json(system: str, user: str, timeout: float = 60.0) -> dict:
     """POST an OpenAI-compatible chat completion and parse JSON content.
 
@@ -148,7 +158,8 @@ def chat_json(system: str, user: str, timeout: float = 60.0) -> dict:
         ],
         "response_format": {"type": "json_object"},
     }
-    resp = httpx.post(
+    client = _get_http_client()
+    resp = client.post(
         url,
         json=payload,
         headers={
@@ -156,9 +167,6 @@ def chat_json(system: str, user: str, timeout: float = 60.0) -> dict:
             "Content-Type": "application/json",
         },
         timeout=timeout,
-        # Deterministic direct connection: env proxies must never
-        # intercept or mangle this call (sandbox proxy env breaks it).
-        trust_env=False,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -440,24 +448,24 @@ def generate_answer(message: str, context_facts: list | None = None) -> str:
     if not key:
         return ""
 
+    if not context_facts:
+        return ""
+
     system_parts = [
-        "You are an intelligent, helpful, and natural AI assistant communicating on WhatsApp.",
-        "Answer the user's message directly, accurately, and naturally, whatever they ask (casual conversation, general knowledge, explanations, math, coding, or document questions).",
-        "Never output robotic disclaimers or repetitive canned text. Answer like a smart, friendly, real conversational assistant.",
-        "Keep answers concise, clear, and cleanly formatted for WhatsApp.",
+        "You are an assistant answering questions strictly from the company's uploaded documents.",
+        "Answer ONLY based on the facts provided below. Do NOT use general knowledge or guess.",
+        "Keep the answer concise and direct (1-2 short sentences, at most 3 lines).",
+        "\nRelevant company documents and records:",
     ]
-    if context_facts:
-        system_parts.append("\nRelevant company documents and records:")
-        for fact in context_facts:
-            src = fact.get("doc_title") or fact.get("source") or "document"
-            text = fact.get("fact", "")
-            eff = fact.get("effective_date")
-            date_str = f" (effective {eff})" if eff else ""
-            system_parts.append(f"- [{src}{date_str}]: {text}")
-        system_parts.append(
-            "\nIf the user's question relates to these documents, answer based on them and cite the document name as evidence. "
-            "If the question is casual chat or general knowledge, answer directly using your own intelligence."
-        )
+    for fact in context_facts:
+        src = fact.get("doc_title") or fact.get("source") or "document"
+        text = fact.get("fact", "")
+        eff = fact.get("effective_date")
+        date_str = f" (effective {eff})" if eff else ""
+        system_parts.append(f"- [{src}{date_str}]: {text}")
+    system_parts.append(
+        "\nIf the facts do not answer the question, reply with an empty string."
+    )
 
     system = "\n".join(system_parts)
     url = _api_base().rstrip("/") + "/chat/completions"
@@ -470,7 +478,7 @@ def generate_answer(message: str, context_facts: list | None = None) -> str:
                     {"role": "system", "content": system},
                     {"role": "user", "content": message},
                 ],
-                "max_tokens": 1000,
+                "max_tokens": 4096,
                 "temperature": 0.7,
             },
             headers={
@@ -524,7 +532,7 @@ def generate_doc_reply(filename: str, text: str | None, fact_count: int) -> str:
                     {"role": "system", "content": "You are a helpful WhatsApp AI assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": 600,
+                "max_tokens": 2048,
                 "temperature": 0.7,
             },
             headers={
@@ -556,63 +564,8 @@ def reply_conversation(message: str) -> str:
 
 
 def generate_smalltalk(message: str) -> str:
-    """Brief warm reply to an exact greeting/pleasantry.
-
-    Makes no factual claim: no company facts, no world facts, no
-    answers to questions — just a greeting back or an acknowledgment.
-    Returns "" when no key is set, the call fails, or the model
-    returns no content (a 200 with null content must never crash —
-    the caller then sends nothing rather than a fabricated reply).
-    """
-    key = _api_key().strip()
-    if not key:
-        return ""
-    url = _api_base().rstrip("/") + "/chat/completions"
-    try:
-        resp = httpx.post(
-            url,
-            json={
-                "model": _api_model(),
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a friendly WhatsApp assistant. The user "
-                            "just sent a short greeting or pleasantry. Reply "
-                            "briefly and warmly in 1-2 short sentences. Do not "
-                            "state any fact about any company, policy, person, "
-                            "place, or the world, and do not answer any "
-                            "question. Just greet back or acknowledge."
-                        ),
-                    },
-                    {"role": "user", "content": message},
-                ],
-                "max_tokens": 200,
-                "temperature": 0.7,
-            },
-            headers={
-                "Authorization": "Bearer " + key,
-                "Content-Type": "application/json",
-            },
-            timeout=30.0,
-            trust_env=False,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        content = _message_content(data)
-        if not content or not content.strip():
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "generate_smalltalk returned no content; replying nothing"
-            )
-            return ""
-        return content.strip()
-    except Exception as exc:
-        import logging
-
-        logging.getLogger(__name__).warning("generate_smalltalk error: %s", exc)
-        return ""
+    """Brief capabilities intro using configured agent name."""
+    return config.intro_message()
 
 
 def compose_email(target_display: str, topic: str, facts: list) -> str:
@@ -666,7 +619,7 @@ def compose_email(target_display: str, topic: str, facts: list) -> str:
                         ),
                     },
                 ],
-                "max_tokens": 600,
+                "max_tokens": 2048,
                 "temperature": 0.2,
             },
             headers={
