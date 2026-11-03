@@ -1,27 +1,27 @@
-"""Targeted proofs for the ACT email action (main).
+"""Targeted proofs for the ACT email action + Gmail connect flow (main).
 
 (a) "inform HR about my reimbursement" routes ACT, with target and
     topic resolved from engine data (approver relation + entities
     learned from uploads), never from a hand-typed domain list.
-(b) With neither OAuth nor SMTP configured, the reply is the honest
-    not-configured message and NOTHING is sent.
-(c) Gmail API OAuth path, against LOCAL servers speaking the real
-    protocols: an always-200 Gmail API server proves send
-    construction; a 401-then-refresh flow proves exactly one
-    refresh-and-retry and that the token file is updated.
-(d) SMTP fallback path, against a LOCAL real SMTP server (real
-    smtplib conversation, captured message), proving the connector
-    speaks SMTP, not a stub — used only when OAuth is not configured.
-(e) SMTP failure yields the honest could-not-send reply, never a
-    success claim; and an OAuth failure is NOT silently retried via
-    SMTP (no double-send risk).
+(b) Gmail NOT connected: the reply is the honest not-connected
+    message naming /auth/gmail, and NOTHING is sent.
+(c) Connect flow: the callback saves a token to the gitignored
+    file, and a subsequent send uses that saved token — proven
+    against LOCAL servers speaking the real Gmail API HTTP
+    protocol, plus the callback wiring via TestClient.
+(d) Gmail API: direct success, and 401 -> exactly one
+    refresh-and-retry with the token file updated.
+(e) Gmail failure yields the honest could-not-send reply, never a
+    success claim. There is no SMTP path anymore to retry through.
 (f) Non-action messages keep their existing routes (question ->
     ENGINE, greeting -> LLM_DIRECT, "tell me about X" -> not ACT).
+(g) Grep proof: zero .env auth key names in app/ code paths.
 
 Notes on what runs without a Meta key on this machine: LLM email
 composition is NOT proven here — the deterministic facts rendering
 is (it can contain nothing but the facts by construction). Live
-Gmail delivery with a real account stays with the founder's PC test.
+Gmail delivery with a real Google account, and the live browser
+login, stay with the founder's PC test.
 
 Run: PYTHONPATH=. python scripts/test_act.py
 Exit code 0 iff every check passes. Cleans its own company rows first.
@@ -30,8 +30,6 @@ Exit code 0 iff every check passes. Cleans its own company rows first.
 import base64
 import json
 import os
-import smtplib
-import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,11 +54,13 @@ SEED_TEXT = (
     "The Reimbursement Policy covers reimbursement claims."
 )
 
-ENV_KEYS = [
-    "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_APP_PASSWORD",
-    "HR_EMAIL", "HR_LEAD_EMAIL",
+# Recipient-only .env values are allowed; auth keys are not. The
+# only .env keys this test ever sets are recipient addresses.
+ENV_KEYS = ["HR_EMAIL", "HR_LEAD_EMAIL"]
+
+FORBIDDEN_ENV_KEYS = [
     "GMAIL_OAUTH_CLIENT_ID", "GMAIL_OAUTH_CLIENT_SECRET",
-    "GMAIL_OAUTH_TOKEN_FILE",
+    "GMAIL_OAUTH_TOKEN_FILE", "SMTP_USER", "SMTP_APP_PASSWORD",
 ]
 
 
@@ -198,136 +198,122 @@ def start_server(handler_cls):
     return server, server.server_address[1]
 
 
-# ---------- local SMTP server (real SMTP conversation) ----------
-
-class SMTPRecorder:
-    def __init__(self):
-        self.data = []
-        self.mail_from = []
-        self.rcpt_to = []
-        self.connections = 0
-
-
-def run_smtp_server(recorder, port_holder, certfile, keyfile):
-    """Local SMTP server speaking the real protocol, with STARTTLS.
-
-    Advertises STARTTLS + AUTH, upgrades to TLS on STARTTLS using a
-    throwaway self-signed cert (test-only), then accepts AUTH, MAIL,
-    RCPT, DATA, QUIT. smtplib's default client context accepts the
-    cert for localhost testing, so the production default path
-    (use_tls=True) runs end to end here — not a stub.
-    """
-    import ssl
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(5)
-    port_holder.append(srv.getsockname()[1])
-    tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls_ctx.load_cert_chain(certfile, keyfile)
-    while True:
-        try:
-            conn, _ = srv.accept()
-        except Exception:
-            return
-        recorder.connections += 1
-        try:
-            fh = conn.makefile("rwb")
-            fh.write(b"220 local test SMTP\r\n")
-            fh.flush()
-            data_mode = False
-            buf = []
-            tls_done = False
-            while True:
-                line = fh.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", "replace").strip()
-                if data_mode:
-                    if text == ".":
-                        recorder.data.append("\n".join(buf))
-                        buf = []
-                        data_mode = False
-                        fh.write(b"250 OK\r\n")
-                        fh.flush()
-                    else:
-                        buf.append(text)
-                    continue
-                upper = text.upper()
-                if upper.startswith("EHLO") or upper.startswith("HELO"):
-                    if tls_done:
-                        fh.write(b"250-local\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
-                    else:
-                        fh.write(b"250-local\r\n250-STARTTLS\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
-                elif upper == "STARTTLS" and not tls_done:
-                    fh.write(b"220 ready\r\n")
-                    fh.flush()
-                    conn = tls_ctx.wrap_socket(conn, server_side=True)
-                    fh = conn.makefile("rwb")
-                    tls_done = True
-                elif upper.startswith("AUTH "):
-                    fh.write(b"235 OK\r\n")
-                elif upper.startswith("MAIL FROM:"):
-                    recorder.mail_from.append(text)
-                    fh.write(b"250 OK\r\n")
-                elif upper.startswith("RCPT TO:"):
-                    recorder.rcpt_to.append(text)
-                    fh.write(b"250 OK\r\n")
-                elif upper == "DATA":
-                    data_mode = True
-                    fh.write(b"354 End data\r\n")
-                elif upper == "QUIT":
-                    fh.write(b"221 Bye\r\n")
-                    fh.flush()
-                    break
-                elif upper in ("RSET", "NOOP"):
-                    fh.write(b"250 OK\r\n")
-                else:
-                    fh.write(b"250 OK\r\n")
-                fh.flush()
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-class RecordingSMTP:
-    """Fake SMTP class recording calls (proves STARTTLS is invoked)."""
-    calls = []
-
-    def __init__(self, host, port, timeout=30):
-        RecordingSMTP.calls.append(("connect", host, port))
-
-    def ehlo(self):
-        RecordingSMTP.calls.append(("ehlo",))
-
-    def starttls(self):
-        RecordingSMTP.calls.append(("starttls",))
-
-    def login(self, user, password):
-        RecordingSMTP.calls.append(("login", user))
-
-    def sendmail(self, frm, to, msg):
-        RecordingSMTP.calls.append(("sendmail", frm, to))
-
-    def quit(self):
-        RecordingSMTP.calls.append(("quit",))
-
-
 def main():
     saved = {key: os.environ.get(key) for key in ENV_KEYS}
     token_path = "/tmp/act_token.json"
+    connect_path = "/tmp/act_connect.json"
+    creds_path = "/tmp/act_creds.json"
+    real_token_path = str(gmail_api.token_path_default())
+    real_connect_path = str(gmail_api.connect_path_default())
+    token_existed = os.path.exists(real_token_path)
+    connect_existed = os.path.exists(real_connect_path)
     try:
+        # (g) Grep proof: zero .env auth key names in app/ code.
+        grep_ok = True
+        grep_detail = ""
+        for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "app")):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                with open(fpath, encoding="utf-8") as fh:
+                    content = fh.read()
+                for key in FORBIDDEN_ENV_KEYS:
+                    if key in content:
+                        grep_ok = False
+                        grep_detail += f"{fpath}:{key} "
+        check("g-no-env-auth-keys", grep_ok, grep_detail or "clean")
+
+        # (c) Connect flow wiring, without Google: auth URL shape,
+        # code exchange against a local token server, callback saves.
+        from app import gmail_connect
+
+        url = gmail_connect.build_auth_url(
+            "cid", "http://127.0.0.1:8000/auth/gmail/callback", "state123")
+        check("c-auth-url-scope",
+              "gmail.send" in url and "response_type=code" in url
+              and "state123" in url, url[:120])
+        check("c-auth-url-no-secret-leak",
+              "csec" not in url, "client_id only, no secret in URL")
+        token_server, token_port = start_server(_TokenHandler)
+        _TokenHandler.seen = []
+        token_data, err = gmail_connect.exchange_code(
+            "authcode1", "cid", "csec",
+            "http://127.0.0.1:8000/auth/gmail/callback",
+            token_url=f"http://127.0.0.1:{token_port}/token")
+        check("c-exchange-code",
+              token_data is not None
+              and token_data.get("access_token") == "new-access-token",
+              str(err))
+
+        # Callback via TestClient with the exchange stubbed (the
+        # exchange itself is proven above against a real server).
+        # Token/connect paths are monkeypatched to temp files so the
+        # real repo data/ directory is never touched by tests.
+        orig_token_path_fn = gmail_api.token_path_default
+        orig_connect_path_fn = gmail_api.connect_path_default
+        gmail_api.token_path_default = lambda: __import__("pathlib").Path(token_path)
+        gmail_api.connect_path_default = lambda: __import__("pathlib").Path(connect_path)
+        orig_exchange = gmail_connect.exchange_code
+        gmail_connect.exchange_code = lambda *a, **k: (
+            {"access_token": "cb-access", "refresh_token": "cb-refresh",
+             "token_uri": "https://oauth2.googleapis.com/token"}, None)
+        # The callback also reads credentials.json; on this VM there
+        # is none, so stub only the credentials load for this block
+        # (the exchange itself is proven above, unstubbed).
+        orig_creds = gmail_api.load_credentials
+        gmail_api.load_credentials = lambda *a, **k: {
+            "client_id": "cid", "client_secret": "csec",
+            "token_uri": "https://oauth2.googleapis.com/token"}
+        try:
+            from fastapi.testclient import TestClient
+
+            from app.main import app as fastapi_app
+
+            client = TestClient(fastapi_app, raise_server_exceptions=False)
+            status_resp = client.get("/auth/gmail/status")
+            check("c-status-endpoint",
+                  status_resp.status_code == 200
+                  and status_resp.json().get("connected") is False,
+                  status_resp.text[:120])
+            gmail_connect._pending["teststate"] = {
+                "created": __import__("time").time(), "hr_email": "hr@example.com",
+            }
+            cb = client.get(
+                "/auth/gmail/callback?code=authcode1&state=teststate")
+            saved_token = None
+            if os.path.exists(token_path):
+                with open(token_path, encoding="utf-8") as fh:
+                    saved_token = json.load(fh)
+            saved_conn = None
+            if os.path.exists(connect_path):
+                with open(connect_path, encoding="utf-8") as fh:
+                    saved_conn = json.load(fh)
+            check("c-callback-saves-token",
+                  cb.status_code == 200 and "Gmail is connected" in cb.text
+                  and saved_token is not None
+                  and saved_token.get("access_token") == "cb-access",
+                  f"status={cb.status_code}")
+            check("c-callback-saves-recipient",
+                  saved_conn is not None
+                  and saved_conn.get("recipients", {}).get("DEFAULT") == "hr@example.com",
+                  str(saved_conn))
+            # Expired/invalid state is rejected, nothing overwritten.
+            bad = client.get("/auth/gmail/callback?code=x&state=nope")
+            check("c-callback-bad-state",
+                  "expired or is invalid" in bad.text, bad.text[:120])
+        finally:
+            gmail_connect.exchange_code = orig_exchange
+            gmail_api.load_credentials = orig_creds
+            gmail_api.token_path_default = orig_token_path_fn
+            gmail_api.connect_path_default = orig_connect_path_fn
+        token_server.shutdown()
+
         with get_conn() as conn:
             apply_actions_migration(conn)
             cleanup(conn)
             seed_result = seed(conn)
 
-            # Seed proof: approver relation exists in stored rows.
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT display_name FROM engine_entities WHERE company_id = %s",
@@ -377,7 +363,8 @@ def main():
             # No hand-typed domain lists in the action path.
             literals_ok = True
             for fname in ("app/engine/router.py", "app/actions.py",
-                          "app/emailer.py", "app/gmail_api.py"):
+                          "app/emailer.py", "app/gmail_api.py",
+                          "app/gmail_connect.py"):
                 with open(os.path.join(ROOT, fname), encoding="utf-8") as fh:
                     content = fh.read().lower()
                 if '"hr"' in content or "'hr'" in content:
@@ -393,18 +380,6 @@ def main():
                 "facts": [{"fact": FACT_45}, {"fact": FACT_15K}],
             }
 
-            # (b) Neither OAuth nor SMTP configured: honest reply, no send.
-            set_env({})
-            reply = actions.handle_act(conn, COMPANY, "employee",
-                                       "919999999999", act_result)
-            conn.commit()
-            row = latest_audit(conn)
-            check("b-not-configured-reply",
-                  "isn't configured" in reply, reply[:120])
-            check("b-not-configured-audit",
-                  row is not None and row[0] == "not_configured",
-                  str(row))
-
             # Facts-only deterministic body (no key on this VM).
             subject, body = emailer.render_facts_email(
                 "HR Lead", "Reimbursement Policy",
@@ -413,62 +388,59 @@ def main():
                   FACT_45 in body and FACT_15K in body
                   and "99999" not in body, subject)
 
-            # (d) SMTP fallback against a LOCAL real SMTP server.
-            import subprocess
+            # Stored-recipient resolution (connect page) + env fallback.
+            with open(connect_path, "w", encoding="utf-8") as fh:
+                json.dump({"recipients": {"HR LEAD": "stored-hr@example.com"}},
+                          fh)
+            orig_load_recipients = gmail_api.load_recipients
+            gmail_api.load_recipients = lambda *a, **k: orig_load_recipients(
+                connect_path)
+            try:
+                addr, src = emailer.resolve_recipient("HR Lead")
+                check("b-recipient-stored-first",
+                      addr == "stored-hr@example.com" and src == "connect",
+                      f"{addr} via {src}")
+            finally:
+                gmail_api.load_recipients = orig_load_recipients
+            os.remove(connect_path)
+            set_env({"HR_EMAIL": "hr@example.com"})
+            addr, src = emailer.resolve_recipient("HR Lead")
+            check("b-recipient-env-fallback",
+                  addr == "hr@example.com" and src == "HR_EMAIL",
+                  f"{addr} via {src}")
 
-            certfile = "/tmp/act_cert.pem"
-            keyfile = "/tmp/act_key.pem"
-            gen = subprocess.run(
-                ["openssl", "req", "-x509", "-newkey", "rsa:2048",
-                 "-keyout", keyfile, "-out", certfile, "-days", "1",
-                 "-nodes", "-subj", "/CN=localhost",
-                 "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
-                capture_output=True)
-            check("d-cert-generated", gen.returncode == 0)
-            recorder = SMTPRecorder()
-            port_holder = []
-            smtp_thread = threading.Thread(
-                target=run_smtp_server,
-                args=(recorder, port_holder, certfile, keyfile),
-                daemon=True)
-            smtp_thread.start()
-            while not port_holder:
-                pass
-            smtp_port = port_holder[0]
-            set_env({
-                "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(smtp_port),
-                "SMTP_USER": "bot@example.com",
-                "SMTP_APP_PASSWORD": "dummy",
-                "HR_EMAIL": "hr@example.com",
-            })
-            reply = actions.handle_act(conn, COMPANY, "employee",
-                                       "919999999999", act_result)
-            conn.commit()
-            row = latest_audit(conn)
-            captured = "\n".join(recorder.data)
-            check("d-smtp-fallback-reply",
-                  reply.startswith("Done") and "HR Lead" in reply, reply)
-            check("d-smtp-fallback-audit",
-                  row is not None and row[0] == "sent_smtp", str(row))
-            check("d-smtp-captured",
-                  FACT_45 in captured and "Reimbursement Policy" in captured,
-                  captured[:150])
+            # (b) Gmail NOT connected: honest reply naming the
+            # connect page, nothing sent. Temporarily move any real
+            # token/connect files aside so the test is hermetic.
+            moved_token = None
+            if token_existed:
+                moved_token = real_token_path + ".testbak"
+                os.rename(real_token_path, moved_token)
+            moved_conn = None
+            if connect_existed:
+                moved_conn = real_connect_path + ".testbak"
+                os.rename(real_connect_path, moved_conn)
+            try:
+                set_env({"HR_EMAIL": "hr@example.com"})
+                reply = actions.handle_act(conn, COMPANY, "employee",
+                                           "919999999999", act_result)
+                conn.commit()
+                row = latest_audit(conn)
+                check("b-not-connected-reply",
+                      "isn't connected" in reply and "/auth/gmail" in reply,
+                      reply[:160])
+                check("b-not-connected-audit",
+                      row is not None and row[0] == "not_configured",
+                      str(row))
+            finally:
+                if moved_token:
+                    os.rename(moved_token, real_token_path)
+                if moved_conn:
+                    os.rename(moved_conn, real_connect_path)
 
-            # STARTTLS is invoked on the default (production) path.
-            RecordingSMTP.calls = []
-            ok, err = emailer.send_email(
-                "hr@example.com", "subj", "body",
-                settings={"host": "127.0.0.1", "port": smtp_port,
-                          "user": "bot@example.com", "password": "dummy"},
-                smtp_class=RecordingSMTP, use_tls=True)
-            kinds = [c[0] for c in RecordingSMTP.calls]
-            check("d-starttls-invoked",
-                  ok and "starttls" in kinds and "login" in kinds
-                  and "sendmail" in kinds, str(kinds))
-
-            # (c) Gmail API: direct success against a local server.
+            # (d) Gmail API via saved token, against local servers.
             gmail_server, gmail_port = start_server(_GmailHandler)
-            token_server, token_port = start_server(_TokenHandler)
+            token_server2, token_port2 = start_server(_TokenHandler)
             _GmailHandler.mode = "ok"
             _GmailHandler.seen = []
             _GmailHandler.raws = []
@@ -477,30 +449,25 @@ def main():
                 json.dump({"token": "valid-access", "refresh_token": "r1",
                            "token_uri": "https://oauth2.googleapis.com/token"},
                           fh)
-            set_env({
-                "GMAIL_OAUTH_CLIENT_ID": "cid",
-                "GMAIL_OAUTH_CLIENT_SECRET": "csec",
-                "GMAIL_OAUTH_TOKEN_FILE": token_path,
-                "HR_EMAIL": "hr@example.com",
-            })
             ok, err = gmail_api.send_via_gmail(
                 "hr@example.com", "Request regarding Reimbursement Policy",
                 FACT_45,
                 api_base=f"http://127.0.0.1:{gmail_port}",
-                token_url=f"http://127.0.0.1:{token_port}/token")
+                token_url=f"http://127.0.0.1:{token_port2}/token",
+                token_path=token_path)
             raw_decoded = ""
             if _GmailHandler.raws:
                 raw_decoded = base64.urlsafe_b64decode(
                     _GmailHandler.raws[0] + "==").decode("utf-8", "replace")
-            check("c-gmail-direct-send", ok, str(err))
-            check("c-gmail-captured",
+            check("d-gmail-direct-send", ok, str(err))
+            check("d-gmail-captured",
                   "Reimbursement Policy" in raw_decoded and FACT_45 in raw_decoded,
                   raw_decoded[:150])
-            check("c-gmail-no-refresh-needed", len(_TokenHandler.seen) == 0,
+            check("d-gmail-no-refresh-needed", len(_TokenHandler.seen) == 0,
                   f"token calls={len(_TokenHandler.seen)}")
 
-            # (c) Gmail API: 401 -> exactly one refresh -> retry success,
-            # and the token file is updated with the new access token.
+            # (d) 401 -> exactly one refresh -> retry success, and
+            # the token file is updated with the new access token.
             _GmailHandler.mode = "401_then_ok"
             _GmailHandler.seen = []
             _GmailHandler.raws = []
@@ -509,46 +476,51 @@ def main():
                 json.dump({"token": "expired-access", "refresh_token": "r1",
                            "token_uri": "https://oauth2.googleapis.com/token"},
                           fh)
+            # Refresh needs client credentials: the connect flow
+            # stores them in the token file on a real machine, but
+            # this temp token has none, so supply a temp
+            # credentials file (test-only wiring, as with endpoints).
+            with open(creds_path, "w", encoding="utf-8") as fh:
+                json.dump({"installed": {"client_id": "cid",
+                                         "client_secret": "csec",
+                                         "token_uri": "https://oauth2.googleapis.com/token"}},
+                          fh)
             ok, err = gmail_api.send_via_gmail(
                 "hr@example.com", "Request regarding Reimbursement Policy",
                 FACT_45,
                 api_base=f"http://127.0.0.1:{gmail_port}",
-                token_url=f"http://127.0.0.1:{token_port}/token")
+                token_url=f"http://127.0.0.1:{token_port2}/token",
+                token_path=token_path,
+                credentials_path=creds_path)
             with open(token_path, encoding="utf-8") as fh:
                 updated = json.load(fh)
-            check("c-gmail-refresh-retry", ok, str(err))
-            check("c-gmail-token-updated",
+            check("d-gmail-refresh-retry", ok, str(err))
+            check("d-gmail-token-updated",
                   updated.get("token") == "new-access-token", str(updated))
-            check("c-gmail-refresh-called-once",
+            check("d-gmail-refresh-called-once",
                   len(_TokenHandler.seen) == 1
                   and "grant_type=refresh_token" in _TokenHandler.seen[0],
                   str(_TokenHandler.seen))
 
-            # (e) Gmail primary through the real handler: OAuth
-            # configured + SMTP closed -> Gmail wins, audit sent_gmail.
-            # handle_act uses production Google URLs, so the test
-            # monkeypatches ONLY the endpoint parameters (test-only
-            # wiring; production code is unchanged) to the local
-            # servers, keeping the real HTTP + refresh logic intact.
+            # (e) Gmail through the real handler: connected + local
+            # servers -> Done + sent_gmail audit. Handler-level
+            # wiring is monkeypatched ONLY for endpoint/token paths
+            # (test-only wiring; production code is unchanged).
             orig_send = gmail_api.send_via_gmail
+            orig_ready = gmail_api.is_gmail_ready
 
-            def local_send(to, subject, body, oauth_config=None):
+            def local_send(to, subject, body, **kwargs):
                 return orig_send(
-                    to, subject, body, oauth_config=oauth_config,
+                    to, subject, body,
                     api_base=f"http://127.0.0.1:{gmail_port}",
-                    token_url=f"http://127.0.0.1:{token_port}/token")
+                    token_url=f"http://127.0.0.1:{token_port2}/token",
+                    token_path=token_path,
+                    credentials_path=creds_path)
 
             gmail_api.send_via_gmail = local_send
+            gmail_api.is_gmail_ready = lambda *a, **k: True
             try:
-                set_env({
-                    "GMAIL_OAUTH_CLIENT_ID": "cid",
-                    "GMAIL_OAUTH_CLIENT_SECRET": "csec",
-                    "GMAIL_OAUTH_TOKEN_FILE": token_path,
-                    "SMTP_HOST": "127.0.0.1", "SMTP_PORT": "59999",
-                    "SMTP_USER": "bot@example.com",
-                    "SMTP_APP_PASSWORD": "dummy",
-                    "HR_EMAIL": "hr@example.com",
-                })
+                set_env({"HR_EMAIL": "hr@example.com"})
                 _GmailHandler.mode = "ok"
                 _GmailHandler.seen = []
                 with open(token_path, "w", encoding="utf-8") as fh:
@@ -560,14 +532,13 @@ def main():
                                            "919999999999", act_result)
                 conn.commit()
                 row = latest_audit(conn)
-                check("e-gmail-primary-via-handler",
+                check("e-gmail-via-handler",
                       reply.startswith("Done") and row is not None
                       and row[0] == "sent_gmail",
                       f"reply={reply} row={row}")
 
-                # (e) OAuth failure is NOT silently retried via SMTP:
-                # Gmail 401 + token server failure -> honest failure,
-                # and the local SMTP server sees no new connection.
+                # (e) Gmail failure: honest could-not-send, never
+                # success, no other transport to fall through to.
                 _GmailHandler.mode = "401_then_ok"
                 _GmailHandler.seen = []
                 _GmailHandler.raws = []
@@ -585,14 +556,15 @@ def main():
                 fail_token_server, fail_token_port = start_server(
                     _FailingTokenHandler)
 
-                def local_send_fail(to, subject, body, oauth_config=None):
+                def local_send_fail(to, subject, body, **kwargs):
                     return orig_send(
-                        to, subject, body, oauth_config=oauth_config,
+                        to, subject, body,
                         api_base=f"http://127.0.0.1:{gmail_port}",
-                        token_url=f"http://127.0.0.1:{fail_token_port}/token")
+                        token_url=f"http://127.0.0.1:{fail_token_port}/token",
+                        token_path=token_path,
+                        credentials_path=creds_path)
 
                 gmail_api.send_via_gmail = local_send_fail
-                smtp_conns_before = recorder.connections
                 with open(token_path, "w", encoding="utf-8") as fh:
                     json.dump({"token": "expired-access",
                                "refresh_token": "r1",
@@ -602,35 +574,18 @@ def main():
                                            "919999999999", act_result)
                 conn.commit()
                 row = latest_audit(conn)
-                check("e-oauth-failure-no-smtp-retry",
+                check("e-gmail-failure-reply",
                       "couldn't send" in reply and row is not None
                       and row[0] == "failed"
-                      and recorder.connections == smtp_conns_before,
-                      f"reply={reply} row={row} "
-                      f"smtp_conns={recorder.connections}")
+                      and not reply.startswith("Done"),
+                      f"reply={reply} row={row}")
                 fail_token_server.shutdown()
             finally:
                 gmail_api.send_via_gmail = orig_send
-
-            # (e) SMTP failure: honest could-not-send, never success.
-            set_env({
-                "SMTP_HOST": "127.0.0.1", "SMTP_PORT": "59999",
-                "SMTP_USER": "bot@example.com",
-                "SMTP_APP_PASSWORD": "dummy",
-                "HR_EMAIL": "hr@example.com",
-            })
-            reply = actions.handle_act(conn, COMPANY, "employee",
-                                       "919999999999", act_result)
-            conn.commit()
-            row = latest_audit(conn)
-            check("e-smtp-failure-reply",
-                  "couldn't send" in reply and not reply.startswith("Done"),
-                  reply)
-            check("e-smtp-failure-audit",
-                  row is not None and row[0] == "failed", str(row))
+                gmail_api.is_gmail_ready = orig_ready
 
             gmail_server.shutdown()
-            token_server.shutdown()
+            token_server2.shutdown()
             cleanup(conn)
     finally:
         for key, value in saved.items():
@@ -638,10 +593,11 @@ def main():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        try:
-            os.remove(token_path)
-        except Exception:
-            pass
+        for path in (token_path, connect_path, creds_path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
     failed = [name for name, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

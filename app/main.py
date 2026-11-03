@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from app import config
 from app.embed import vectors_available
+from app.gmail_connect import router as gmail_connect_router
 from app.graph import router as graph_router
 from app.timeline import router as timeline_router
 from app.upload import router as upload_router
@@ -25,6 +26,7 @@ from app.whatsapp import router as whatsapp_router
 
 app = FastAPI(title="company-brain")
 app.include_router(whatsapp_router)
+app.include_router(gmail_connect_router)
 app.include_router(timeline_router)
 app.include_router(upload_router)
 app.include_router(graph_router)
