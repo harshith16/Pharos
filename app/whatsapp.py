@@ -442,6 +442,29 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
     with open(storage_path, "wb") as fh:
         fh.write(data)
     caption = msg.get("caption")
+    if msg["kind"] == "image":
+        from app import receipts as receipts_mod
+
+        if receipts_mod.is_receipt_caption(caption):
+            # Receipt path (P1-4): Meta vision first, Ollama vision
+            # fallback inside process_receipt. A receipt is an
+            # action, not company knowledge — no fact storage, no
+            # engine ingest; the email audit row is the record.
+            transcription = None
+            try:
+                from app.llm import transcribe_image
+
+                transcription = transcribe_image(
+                    data, mime_type or "image/jpeg"
+                )
+            except Exception:
+                transcription = None
+            with scoped_conn("ceo", unlocked=True) as conn:
+                return receipts_mod.process_receipt(
+                    conn, company_id, msg["sender"],
+                    _role_for(msg["sender"]), transcription, data,
+                    mime_type or "image/jpeg",
+                )
     text = extract_text(msg["filename"], data)
     if caption:
         if text:
