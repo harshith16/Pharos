@@ -104,22 +104,62 @@ def _media_reply(kind: str, filename: str, text, fact_count: int,
     return f"Got it — I've saved {filename}. You can ask me questions about it."
 
 
-def _answer_text(company_id: str, role: str, question: str, sender: str = "") -> str:
-    """WhatsApp text answer, decided entirely by the engine router.
+def _route_on_scoped(company_id: str, role: str, question: str,
+                     sender: str, unlocked: bool):
+    """Route one question on an RLS-scoped connection and, for ACT,
+    execute the decided action. Returns the reply text ("" when the
+    router produced nothing sendable). The scoped connection carries
+    the sender's role and unlock state, so RLS hides sensitive rows
+    unless the code gate opened them — the role filter still applies
+    after unlock, so an unlocked employee still sees general only.
+    """
+    from app.db import scoped_conn
+    from app.engine import router as engine_router
 
-    This layer makes no routing decision of its own: it opens a
-    connection, hands the question to the engine router, and returns
-    what the router decides — an engine answer from uploaded facts,
-    the plain not-found reply, a small-talk model reply that makes
-    no factual claim, or, for the ACT route, the result of executing
-    the decided action (app.actions sends the real email and this
-    returns its honest confirmation). An empty router answer (e.g. a
+    with scoped_conn(role, unlocked=unlocked) as sconn:
+        result = engine_router.answer_question(
+            sconn, company_id, role, question
+        )
+        if isinstance(result, dict) and result.get("route") == "ACT":
+            from app import actions
+
+            return actions.handle_act(sconn, company_id, role, sender, result)
+    answer = result.get("answer") if isinstance(result, dict) else ""
+    if isinstance(answer, str) and answer.strip():
+        return answer
+    return ""
+
+
+def _answer_text(company_id: str, role: str, question: str, sender: str = "") -> str:
+    """WhatsApp text answer, decided entirely by the engine router,
+    with the 8-digit code gate (app.security) in front of it.
+
+    Gate flow, per sender, before any normal routing:
+    - a code-shaped message (exactly 8 digits) while a question is
+      pending is a code attempt, never an ordinary message: correct
+      -> unlock 30 minutes and answer the pending question at once
+      under the role filter; wrong -> incorrect reply, attempt
+      logged, pending kept for retry; 3rd consecutive failure ->
+      15-minute lockout reply. A code-shaped message with nothing
+      pending is treated normally (it is just a message).
+    - any other message routes normally, except: when the question's
+      covering facts include sensitive rows the sender's role may
+      see, the reply is the code challenge instead (no facts, no
+      hints) and the question is held as pending. Role-hidden facts
+      never reach the challenge — the role filter decides those,
+      code or no code.
+    Without a sender (direct library calls, older tests) the gate
+    has no one to track, so the question routes on a plain
+    connection exactly as before. An empty router answer (e.g. a
     model failure on the small-talk route) returns "" so the caller
     sends nothing. Only the router's answer text is ever returned;
     no canned factual text and no word list lives here.
     """
     try:
-        from app.db import get_conn
+        from datetime import datetime, timezone
+
+        from app import security
+        from app.db import get_conn, scoped_conn
         from app.engine import router as engine_router
 
         conn = None
@@ -131,6 +171,64 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                 conn = ctx.__enter__()
             else:
                 conn = candidate
+            if sender:
+                now = datetime.now(timezone.utc)
+                text = (question or "").strip()
+                # Code attempt: only while a question is pending.
+                if security.is_code_attempt(text):
+                    if security.is_locked(conn, sender, now):
+                        return security.CODE_LOCKED_REPLY
+                    pending = security.peek_pending(conn, sender)
+                    if pending is not None:
+                        _pc, _pr, pending_q = pending
+                        stored = security.get_stored_code(conn)
+                        if stored is None:
+                            return (
+                                "No authentication code has been set up "
+                                "yet. Ask the administrator to set one up "
+                                "first."
+                            )
+                        salt_hex, expected = stored
+                        if security.verify_code(text, salt_hex, expected):
+                            security.record_success(conn, sender, now)
+                            security.take_pending(conn, sender)
+                            return _route_on_scoped(
+                                _pc, _pr, pending_q, sender, unlocked=True
+                            )
+                        locked_now = security.record_failure(
+                            conn, sender, now
+                        )
+                        if locked_now:
+                            return security.CODE_LOCKED_REPLY
+                        return security.CODE_INCORRECT_REPLY
+                    # No pending question: fall through, treated normally.
+                unlocked = security.is_unlocked(conn, sender, now)
+                result = None
+                with scoped_conn(role, unlocked=unlocked) as sconn:
+                    result = engine_router.answer_question(
+                        sconn, company_id, role, question
+                    )
+                    if isinstance(result, dict) and result.get("route") == "ACT":
+                        from app import actions
+
+                        return actions.handle_act(
+                            sconn, company_id, role, sender, result
+                        )
+                route = result.get("route") if isinstance(result, dict) else ""
+                # Sensitive cover: challenge instead of answering.
+                if route in ("ENGINE", "NOT_FOUND") and not unlocked:
+                    sensitive, _vis = security.find_sensitive_covering(
+                        conn, company_id, role, question
+                    )
+                    if sensitive:
+                        security.store_pending(
+                            conn, sender, company_id, role, question
+                        )
+                        return security.CODE_CHALLENGE_REPLY
+                answer = result.get("answer") if isinstance(result, dict) else ""
+                if isinstance(answer, str) and answer.strip():
+                    return answer
+                return ""
             result = engine_router.answer_question(
                 conn, company_id, role, question
             )
@@ -309,7 +407,13 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
     no text (or no LLM key for fact extraction) still leaves the
     document saved and searchable — the reply says exactly that.
     """
-    from app.db import get_conn
+    # Operator scope for intake writes: Postgres checks INSERT ...
+    # RETURNING against the SELECT policy, so a restricted-scope
+    # fact (e.g. finance) can only be written on a connection whose
+    # variables pass that policy. Intake is a server-side operator
+    # action, not a sender read — sender reads stay sender-scoped
+    # in _answer_text, where RLS still gates them.
+    from app.db import scoped_conn
     from app.extract_text import extract_text
     from app.store import ingest_document, ingest_media
 
@@ -328,7 +432,7 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
         else:
             text = f"Caption: {caption}"
     engine_entities = None
-    with get_conn() as conn:
+    with scoped_conn("ceo", unlocked=True) as conn:
         ingest_media(
             conn,
             company_id,

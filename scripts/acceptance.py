@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import embed
 from app.answer import answer_question
-from app.db import get_conn
+from app.db import get_conn, scoped_conn
 from app.extract_text import extract_text
 from app.retrieve import get_timeline, search, search_as_of
 from app.store import ingest_chat_message, ingest_media, link_media_to_fact, write_fact
@@ -144,36 +144,44 @@ def main():
             supersedes_id=old_id,
             relation="updates",
         )
-        fin_id = write_fact(
-            conn,
-            COMPANY,
-            "Quarterly finance close is approved by the CFO.",
-            domain="finance",
-            effective_date=date(2026, 1, 1),
-            source="manual",
-            triples=[
-                {
-                    "source": "finance_policy",
-                    "relationship": "close_approver",
-                    "destination": "cfo",
-                }
-            ],
-        )
-        tech_id = write_fact(
-            conn,
-            COMPANY,
-            "Production deploys need CTO approval.",
-            domain="technical",
-            effective_date=date(2026, 1, 1),
-            source="manual",
-            triples=[
-                {
-                    "source": "deploy_policy",
-                    "relationship": "approver",
-                    "destination": "cto",
-                }
-            ],
-        )
+        # Restricted-scope seeds need operator scope: Postgres checks
+        # INSERT ... RETURNING against the SELECT policy, so a
+        # finance/technical row cannot be written on a default
+        # connection. General seeds above work unscoped. One scoped
+        # connection per fact: each write_fact commits, and a commit
+        # clears SET LOCAL variables.
+        with scoped_conn("ceo", unlocked=True) as wconn:
+            fin_id = write_fact(
+                wconn,
+                COMPANY,
+                "Quarterly finance close is approved by the CFO.",
+                domain="finance",
+                effective_date=date(2026, 1, 1),
+                source="manual",
+                triples=[
+                    {
+                        "source": "finance_policy",
+                        "relationship": "close_approver",
+                        "destination": "cfo",
+                    }
+                ],
+            )
+        with scoped_conn("ceo", unlocked=True) as wconn:
+            tech_id = write_fact(
+                wconn,
+                COMPANY,
+                "Production deploys need CTO approval.",
+                domain="technical",
+                effective_date=date(2026, 1, 1),
+                source="manual",
+                triples=[
+                    {
+                        "source": "deploy_policy",
+                        "relationship": "approver",
+                        "destination": "cto",
+                    }
+                ],
+            )
 
         # (a) Current returns 12000 only.
         ans = answer_question(conn, COMPANY, "employee", "What is the travel limit?")
@@ -228,16 +236,25 @@ def main():
         # (d) Hierarchy roles: CEO sees all, CFO finance not
         # technical, CTO technical not finance, employee general
         # only. Travel (general) is visible to every role.
+        # RLS: finance/technical facts are sensitive (their
+        # visible_to lacks 'employee'), so the allowed-role reads
+        # run on scoped connections with the unlock on — the state
+        # a correct code creates. The employee reads stay on the
+        # default connection and must stay hidden.
         def _ids(rows):
             return {r["id"] for r in rows}
 
-        ceo_fin = _ids(search(conn, COMPANY, "ceo", "finance close"))
-        cfo_fin = _ids(search(conn, COMPANY, "cfo", "finance close"))
-        cto_fin = _ids(search(conn, COMPANY, "cto", "finance close"))
+        def _search_scoped(role, q):
+            with scoped_conn(role, unlocked=True) as sc:
+                return search(sc, COMPANY, role, q)
+
+        ceo_fin = _ids(_search_scoped("ceo", "finance close"))
+        cfo_fin = _ids(_search_scoped("cfo", "finance close"))
+        cto_fin = _ids(_search_scoped("cto", "finance close"))
         emp_fin = _ids(search(conn, COMPANY, "employee", "finance close"))
-        ceo_tech = _ids(search(conn, COMPANY, "ceo", "production deploys"))
-        cfo_tech = _ids(search(conn, COMPANY, "cfo", "production deploys"))
-        cto_tech = _ids(search(conn, COMPANY, "cto", "production deploys"))
+        ceo_tech = _ids(_search_scoped("ceo", "production deploys"))
+        cfo_tech = _ids(_search_scoped("cfo", "production deploys"))
+        cto_tech = _ids(_search_scoped("cto", "production deploys"))
         emp_tech = _ids(search(conn, COMPANY, "employee", "production deploys"))
         ceo_travel = answer_question(conn, COMPANY, "ceo", "What is the travel limit?")
         emp_travel = answer_question(

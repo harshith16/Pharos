@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.db import get_conn
+from app.db import get_conn, scoped_conn
 from app.engine import dedup, entities, ingest, query, relations
 from app.store import write_fact
 
@@ -309,16 +309,26 @@ def main():
             (COMPANY, "approves")).fetchone()
         # Restrict the newest approves relation (Finance Board -> Budget Office)
         # to finance+CEO only; find it precisely via its endpoints.
+        # The narrowing UPDATE needs operator scope: Postgres checks
+        # a written row version against the SELECT policy, so a
+        # restricted new version fails on a default connection.
         src, dst = entity_id(conn, "finance board"), entity_id(conn, "budget office")
-        conn.execute(
-            "UPDATE engine_relations SET visible_to = ARRAY['cfo','ceo'] "
-            "WHERE company_id = %s AND src_id = %s AND dst_id = %s AND rel = %s",
-            (COMPANY, src, dst, "approves"))
+        with scoped_conn("ceo", unlocked=True) as uconn:
+            uconn.execute(
+                "UPDATE engine_relations SET visible_to = ARRAY['cfo','ceo'] "
+                "WHERE company_id = %s AND src_id = %s AND dst_id = %s AND rel = %s",
+                (COMPANY, src, dst, "approves"))
         conn.commit()
         emp = query.answer_with_graph(conn, COMPANY, "employee",
                                       "How is Finance Board connected to Budget Office?")
-        cfo = query.answer_with_graph(conn, COMPANY, "cfo",
-                                      "How is Finance Board connected to Budget Office?")
+        # RLS: the restricted relation is sensitive (visible_to lacks
+        # 'employee'), so the CFO graph read needs a scoped connection
+        # with the unlock on — the same state a correct code creates.
+        # The employee read above stays on the default connection.
+        with scoped_conn("cfo", unlocked=True) as cfo_conn:
+            cfo = query.answer_with_graph(
+                cfo_conn, COMPANY, "cfo",
+                "How is Finance Board connected to Budget Office?")
         check("role filter hides finance path from employee",
               emp.get("empty") is True, str(emp.get("answer"))[:80])
         check("role filter shows finance path to CFO",

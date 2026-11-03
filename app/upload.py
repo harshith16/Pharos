@@ -40,7 +40,10 @@ async def upload_file(
     best-effort, never failing the upload itself.
     """
     from app import config
-    from app.db import get_conn
+    # Operator scope for intake writes (see whatsapp._process_media):
+    # Postgres checks INSERT ... RETURNING against the SELECT
+    # policy, so restricted-scope facts need ceo+unlocked variables.
+    from app.db import scoped_conn
     from app.store import ingest_document, ingest_media
 
     filename = _safe_filename(file.filename)
@@ -52,7 +55,7 @@ async def upload_file(
     with open(storage_path, "wb") as fh:
         fh.write(content)
     company_id = config.COMPANY_ID
-    with get_conn() as conn:
+    with scoped_conn("ceo", unlocked=True) as conn:
         media_id = ingest_media(
             conn,
             company_id,
@@ -73,7 +76,7 @@ async def upload_file(
         extracted = extract_text(filename, content)
         if extracted:
             text_extracted = True
-            with get_conn() as conn:
+            with scoped_conn("ceo", unlocked=True) as conn:
                 doc_id = ingest_document(
                     conn, company_id, f"upload:{media_id}", filename, extracted
                 )

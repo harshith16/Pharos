@@ -60,13 +60,17 @@ def _normalize_rel(rel) -> str:
     return " ".join(str(rel).strip().lower().split())
 
 
-def add_relation(conn, company_id, src_name, rel, dst_name, evidence=None) -> str:
+def add_relation(conn, company_id, src_name, rel, dst_name, evidence=None,
+                 visible_to=None) -> str:
     """Upsert one typed relation between two entities; return its id.
 
     Both endpoint names resolve via entities.resolve_entity. On a
     unique-key conflict, new evidence ids merge into evidence JSONB
     deduped, and weight becomes the evidence count (minimum 1.0).
-    Never commits.
+    When visible_to is given, a newly inserted relation carries it
+    (its is_sensitive flag follows from the trigger); an existing
+    relation keeps its stored scope — sync never widens or narrows
+    one (fail-closed). Never commits.
     """
     rel_norm = _normalize_rel(rel)
     if not rel_norm:
@@ -94,12 +98,21 @@ def add_relation(conn, company_id, src_name, rel, dst_name, evidence=None) -> st
         )
         return str(rel_id)
     weight = max(1.0, float(len(new_evidence)))
-    row = conn.execute(
-        "INSERT INTO engine_relations (company_id, src_id, dst_id, rel, "
-        "evidence, weight) VALUES (%s, %s, %s, %s, %s::jsonb, %s) "
-        "RETURNING id",
-        (company_id, src_id, dst_id, rel_norm, json.dumps(new_evidence), weight),
-    ).fetchone()
+    if visible_to is None:
+        row = conn.execute(
+            "INSERT INTO engine_relations (company_id, src_id, dst_id, rel, "
+            "evidence, weight) VALUES (%s, %s, %s, %s, %s::jsonb, %s) "
+            "RETURNING id",
+            (company_id, src_id, dst_id, rel_norm, json.dumps(new_evidence), weight),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "INSERT INTO engine_relations (company_id, src_id, dst_id, rel, "
+            "evidence, weight, visible_to) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) "
+            "RETURNING id",
+            (company_id, src_id, dst_id, rel_norm, json.dumps(new_evidence), weight,
+             list(visible_to)),
+        ).fetchone()
     return str(row[0])
 
 
@@ -209,16 +222,26 @@ def sync_from_edges(conn, company_id) -> dict:
 
     Every edges row for the company resolves its subject/object as
     entities and upserts the relation with evidence=[str(memory_id)].
-    Counts only genuinely new entities and relations. Never commits.
+    A newly created relation inherits its parent fact's visible_to,
+    so sensitivity propagates from legacy facts into the graph (a
+    finance fact's relation is finance-scoped, and its
+    is_sensitive flag follows from the trigger). An already-stored
+    relation keeps its scope (fail-closed: sync never widens one).
+    Under RLS this read sees only the connection's visible edges —
+    syncing restricted facts needs a scoped connection (see
+    app.db.scoped_conn). Counts only genuinely new entities and
+    relations. Never commits.
     """
     rows = conn.execute(
-        "SELECT memory_id, subject, relationship, object FROM edges "
-        "WHERE company_id = %s ORDER BY created_at",
+        "SELECT e.memory_id, e.subject, e.relationship, e.object, "
+        "m.visible_to FROM edges e "
+        "LEFT JOIN memories m ON m.id = e.memory_id "
+        "WHERE e.company_id = %s ORDER BY e.created_at",
         (company_id,),
     ).fetchall()
     entities_created = 0
     relations_created = 0
-    for memory_id, subject, relationship, obj in rows:
+    for memory_id, subject, relationship, obj, parent_vis in rows:
         if not subject or not str(subject).strip():
             continue
         if not obj or not str(obj).strip():
@@ -246,6 +269,7 @@ def sync_from_edges(conn, company_id) -> dict:
             rel_norm,
             obj,
             evidence=[str(memory_id)],
+            visible_to=list(parent_vis) if parent_vis else None,
         )
         if existing is None:
             relations_created += 1

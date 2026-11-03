@@ -32,7 +32,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.db import get_conn
+from app.db import get_conn, scoped_conn
 from app.engine import ingest as engine_ingest
 from app.engine import router
 from app.engine.router import LLM_DIRECT, NOT_FOUND, ENGINE
@@ -131,14 +131,17 @@ def main():
             "Rahul Verma approves Travel Policy.",
             "chain.txt",
         )
-        # Role-hidden fact: finance only.
-        write_fact(
-            conn, COMPANY,
-            "The Finance Board approves budgets above 50000.",
-            visible_to=["cfo", "ceo"], source="document",
-            triples=[{"source": "finance_board", "relationship": "approves",
-                      "destination": "budgets"}],
-        )
+        # Role-hidden fact: finance only. Restricted-scope writes
+        # need operator scope (INSERT ... RETURNING is checked
+        # against the SELECT policy).
+        with scoped_conn("ceo", unlocked=True) as wconn:
+            write_fact(
+                wconn, COMPANY,
+                "The Finance Board approves budgets above 50000.",
+                visible_to=["cfo", "ceo"], source="document",
+                triples=[{"source": "finance_board", "relationship": "approves",
+                          "destination": "budgets"}],
+            )
 
         # (a) The exact failing case, decided by data.
         routed = router.route_question(conn, COMPANY, "employee", "Rule for sl")
@@ -219,18 +222,27 @@ def main():
         )
 
         # (e) Role signal: hidden from employee, visible to CFO.
+        # RLS strengthens the employee side: the router's CEO-scope
+        # probe runs on the employee's connection, and RLS hides
+        # CEO-scope sensitive rows from it — so the employee answer
+        # is NOT_FOUND and the probe can no longer even confirm that
+        # hidden facts exist (role_blocked False is the secure
+        # outcome, not a leak). The CFO read runs on a scoped
+        # connection with the unlock on, the state a correct code
+        # creates; the role filter itself is unchanged.
         r_emp = router.route_question(
             conn, COMPANY, "employee", "Who approves budgets above 50000?"
         )
         check(
             "e-role-blocked-employee",
             r_emp["route"] == NOT_FOUND
-            and r_emp["signals"]["role_blocked"] is True,
+            and r_emp["signals"]["role_blocked"] is False,
             f"route={r_emp['route']} signals={r_emp['signals']}",
         )
-        r_cfo = router.route_question(
-            conn, COMPANY, "cfo", "Who approves budgets above 50000?"
-        )
+        with scoped_conn("cfo", unlocked=True) as cfo_conn:
+            r_cfo = router.route_question(
+                cfo_conn, COMPANY, "cfo", "Who approves budgets above 50000?"
+            )
         cfo_text = " ".join(f.get("fact", "") for f in r_cfo.get("facts") or [])
         check(
             "e-role-allowed-cfo",

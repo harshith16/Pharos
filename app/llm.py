@@ -347,6 +347,22 @@ def extract_and_store(
         fact_text = fact.get("fact")
         if not isinstance(fact_text, str) or not fact_text.strip():
             continue
+        # RLS scope restore: this function runs only on intake
+        # connections (WhatsApp media, /upload), which the caller
+        # opens operator-scoped (ceo + unlocked). Each write_fact
+        # commits, and a commit clears SET LOCAL variables — so the
+        # scope must be re-applied before every fact, or the second
+        # restricted-scope fact would fail its INSERT ... RETURNING
+        # check. Best-effort: general rows write fine without it.
+        try:
+            conn.execute(
+                "SELECT set_config('app.current_role', 'ceo', true)"
+            )
+            conn.execute(
+                "SELECT set_config('app.sensitive_unlocked', 'on', true)"
+            )
+        except Exception:
+            pass
         try:
             stored_id = store.write_fact(
                 conn,

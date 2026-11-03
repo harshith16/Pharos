@@ -35,11 +35,19 @@ def _company_id(company: str | None) -> str:
 
 
 def _fetch_graph(company_id: str) -> dict:
-    """Read real rows only. Any failure yields empty lists, never a 500."""
-    try:
-        from app.db import get_conn
+    """Read real rows only. Any failure yields empty lists, never a 500.
 
-        with get_conn() as conn:
+    RLS scoping is explicit here: this is the server operator's
+    local debug view, not a sender-facing surface, so it reads as
+    CEO with the unlock on (the full real graph, for the demo).
+    WhatsApp answers are unaffected — they scope per sender in
+    app.whatsapp, where RLS still hides sensitive rows from
+    senders without a code.
+    """
+    try:
+        from app.db import scoped_conn
+
+        with scoped_conn("ceo", unlocked=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, name, display_name, kind FROM engine_entities"
