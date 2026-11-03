@@ -67,7 +67,9 @@ def _role_for(sender: str) -> str:
     return "employee"
 
 
-NOT_FOUND_REPLY = "I couldn't find that in the company documents."
+# Kept in sync with app.engine.router.NOT_FOUND_REPLY (authoritative
+# for the NOT_FOUND route); out-of-scope replies use this exact text.
+NOT_FOUND_REPLY = "Not found in company documents."
 MEDIA_NOT_READ_REPLY = (
     "I couldn't read that file — no text could be extracted from it. "
     "Please send a clearer image or the document as text."

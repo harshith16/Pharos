@@ -59,7 +59,7 @@ try:  # Small-talk model reply for the LLM_DIRECT route.
 except ImportError:  # pragma: no cover - parallel-build tolerance
     llm = None
 
-NOT_FOUND_REPLY = "I couldn't find that in the company documents."
+NOT_FOUND_REPLY = "Not found in company documents."
 
 ENGINE = "ENGINE"
 NOT_FOUND = "NOT_FOUND"
@@ -522,6 +522,23 @@ def answer_question(conn, company_id, role, question) -> dict:
                 if text:
                     out = dict(result)
                     out["answer"] = text
+                    return out
+        except Exception:
+            pass
+        # Source tags on every other factual answer: doc + date +
+        # current/superseded, appended to the delivered text.
+        try:
+            from app import sourcetags as tags_mod
+
+            answer = result.get("answer") or ""
+            facts = result.get("facts") or []
+            if answer.strip() and facts:
+                tagged = tags_mod.tag_answer(
+                    conn, company_id, answer, facts
+                )
+                if tagged != answer:
+                    out = dict(result)
+                    out["answer"] = tagged
                     return out
         except Exception:
             pass
