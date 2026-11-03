@@ -507,4 +507,22 @@ def answer_question(conn, company_id, role, question) -> dict:
         out["answer"] = reply
         out["empty"] = not bool(reply.strip())
         return out
+    if result["route"] == ENGINE:
+        # As-of questions get the deterministic version-chain
+        # answer (both values with source tags) instead of a
+        # synthesis that might mention only one version. No key
+        # needed: timelines are stored data.
+        try:
+            from app import asof as asof_mod
+
+            if asof_mod.is_asof_question(question):
+                text = asof_mod.asof_answer(
+                    conn, company_id, result.get("facts") or []
+                )
+                if text:
+                    out = dict(result)
+                    out["answer"] = text
+                    return out
+        except Exception:
+            pass
     return result
