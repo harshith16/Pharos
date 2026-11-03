@@ -219,6 +219,16 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                         if next_alert:
                             return f"{reply}\n\n{next_alert}"
                         return reply
+                    # Access request second: a YES/NO with only an
+                    # access request pending resolves that; with
+                    # neither pending it routes normally below.
+                    from app import roleblock as roleblock_mod
+
+                    access_reply = roleblock_mod.resolve_access_request(
+                        company_id, sender, lowered == "yes"
+                    )
+                    if access_reply is not None:
+                        return access_reply
                 unlocked = security.is_unlocked(conn, sender, now)
                 result = None
                 with scoped_conn(role, unlocked=unlocked) as sconn:
@@ -242,6 +252,25 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             conn, sender, company_id, role, question
                         )
                         return security.CODE_CHALLENGE_REPLY
+                # Role-block: a NOT_FOUND question covered only by
+                # facts this role may not see gets the next step,
+                # not the plain not-found text.
+                if route == "NOT_FOUND":
+                    from app import roleblock as roleblock_mod
+
+                    blocked = roleblock_mod.detect_role_block(
+                        company_id, role, question
+                    )
+                    if blocked is not None:
+                        scope_label, approver, approver_role = blocked
+                        roleblock_mod.store_request(
+                            company_id, sender, scope_label, approver,
+                            approver_role, question,
+                        )
+                        return (
+                            f"Restricted to {scope_label}. "
+                            f"Request access from {approver}?"
+                        )
                 answer = result.get("answer") if isinstance(result, dict) else ""
                 if isinstance(answer, str) and answer.strip():
                     return answer

@@ -1,4 +1,15 @@
-"""Meta Model API client: fact extraction + answer synthesis.
+"""Model client: fact extraction + answer synthesis.
+
+Provider switch (P1-6): LLM_PROVIDER=meta|ollama, default meta,
+selected once at import (a server restart picks it up). "meta"
+is the Meta Model API; "ollama" is a local open-weight Llama
+model served by Ollama's OpenAI-compatible endpoint
+(OLLAMA_URL + "/v1", model OLLAMA_MODEL, default llama3.2:3b).
+Every function below keeps its signature and prompts; only the
+base URL, model, and key change, so answers, extraction, and
+composition all work through the same code on either provider.
+Vision under ollama uses OLLAMA_VISION_MODEL (default moondream),
+because a text Llama model cannot read images.
 
 Only fictional sample-company data ever goes through the Meta API.
 This is required by the free-credit product-improvement clause: content
@@ -25,16 +36,53 @@ _DEFAULT_VISIBLE_TO = ["employee", "cfo", "cto", "ceo"]
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _normalize_provider(value) -> str:
+    """LLM_PROVIDER to "meta" or "ollama"; anything else (including
+    empty) falls back to meta, never crashes startup."""
+    cleaned = (value or "").strip().lower()
+    return cleaned if cleaned in ("meta", "ollama") else "meta"
+
+
+# Selected once at import (server startup). Tests may assign
+# app.llm.PROVIDER directly; production changes need a restart.
+PROVIDER = _normalize_provider(os.environ.get("LLM_PROVIDER", ""))
+
+
+def _ollama_base() -> str:
+    return (
+        os.environ.get("OLLAMA_URL")
+        or config.OLLAMA_URL
+        or "http://localhost:11434"
+    ).rstrip("/")
+
+
 def _api_key() -> str:
+    if PROVIDER == "ollama":
+        # Ollama ignores auth; the placeholder only keeps the
+        # client's key checks (and has_key gates) passing locally.
+        return "ollama"
     return config.META_API_KEY or os.environ.get("META_API_KEY", "")
 
 
 def _api_base() -> str:
+    if PROVIDER == "ollama":
+        return _ollama_base() + "/v1"
     return config.META_API_BASE or os.environ.get("META_API_BASE", "")
 
 
 def _api_model() -> str:
+    if PROVIDER == "ollama":
+        return os.environ.get("OLLAMA_MODEL") or "llama3.2:3b"
     return config.META_MODEL or os.environ.get("META_MODEL", "")
+
+
+def _vision_model() -> str:
+    """Vision model for image transcription: the vision model
+    under ollama, the chat model under meta (muse-spark reads
+    images through the same endpoint)."""
+    if PROVIDER == "ollama":
+        return os.environ.get("OLLAMA_VISION_MODEL") or "moondream"
+    return _api_model()
 
 
 def has_key() -> bool:
@@ -647,7 +695,9 @@ def compose_email(target_display: str, topic: str, facts: list) -> str:
 
 
 def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str | None:
-    """Extract and transcribe all text, numbers, and information from image bytes using Meta Model API."""
+    """Extract and transcribe all text, numbers, and information
+    from image bytes, via the selected provider (vision model
+    under ollama, chat model under meta)."""
     import base64
     key = _api_key().strip()
     if not key or not image_bytes:
@@ -658,7 +708,7 @@ def transcribe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str |
     url = _api_base().rstrip("/") + "/chat/completions"
 
     payload = {
-        "model": _api_model(),
+        "model": _vision_model(),
         "messages": [
             {
                 "role": "user",
