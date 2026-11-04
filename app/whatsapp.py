@@ -78,11 +78,11 @@ def _format_approved_finance_reply(question: str, raw_answer: str) -> str:
     """Format CEO sensitive finance answer in the exact required shape:
     Approved. <topic>: <value>. (at most 2 lines, simple, no extras).
     """
+    # No hardcoded answers here: the value must come from the engine
+    # (raw_answer), whatever the question is. This formatter only
+    # shapes that engine answer into "Approved. <answer>".
     q_lower = (question or "").lower()
-    if "quarterly budget" in q_lower or "budget" in q_lower:
-        return "Approved. Quarterly budget: Rs. 5,00,000."
-
-    finance_keywords = ["revenue", "profit", "salary of", "payroll", "finance", "audit", "investor", "tax"]
+    finance_keywords = ["revenue", "profit", "salary of", "payroll", "finance", "audit", "investor", "tax", "budget"]
     if any(k in q_lower for k in finance_keywords):
         clean = re.sub(r"\[id:\s*[^\]]+\]", "", raw_answer or "")
         clean = re.split(r"\n\s*Sources?:", clean, flags=re.IGNORECASE)[0].strip()

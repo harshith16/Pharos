@@ -1,20 +1,13 @@
-"""Fictional demo-company data (P2-7/P2-8 shared source of truth).
+"""Fictional demo-company data for the demo seed.
 
-Every fact is fictional sample-company data (Meridian Field
-Services, a placeholder company). The eval script (scripts/eval.py)
-and the demo seed script (scripts/seed_demo.py) both load exactly
-these facts, so eval questions and demo beats always agree.
+Every fact here is fictional sample-company data (Meridian Field
+Services). scripts/seed_demo.py loads exactly these facts.
 
 Each entry: (fact, visible_to, effective_date, doc_title).
 "supersedes" links a newer fact to the older entry it replaces
 (by list index); the older row is kept with status superseded.
 Doc texts are one line per fact, so each document's content is
 exactly the facts it carries.
-
-Seeding opens one operator-scoped connection per fact: a
-write_fact commit clears SET LOCAL, so sharing one scoped
-connection across restricted writes breaks the second one (the
-same RLS gotcha the test suites work around).
 """
 
 from datetime import date
