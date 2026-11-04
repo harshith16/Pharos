@@ -213,6 +213,9 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             raw = _route_on_scoped(
                                 _pc, _pr, pending_q, sender, unlocked=True
                             )
+                            conn.execute("DELETE FROM code_unlocks WHERE sender = %s", (sender,))
+                            if hasattr(conn, "commit"):
+                                conn.commit()
                             return _format_approved_finance_reply(pending_q, raw)
                         locked_now = security.record_failure(
                             conn, sender, now
