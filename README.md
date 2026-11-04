@@ -149,4 +149,4 @@ claims it is already live.
 - WhatsApp delivery depends on a live tunnel and a current
   WhatsApp token; temporary tokens expire after 24 hours.
 
-Final commit.
+Final commit — production code only.
