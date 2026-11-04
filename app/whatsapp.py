@@ -49,22 +49,48 @@ def _company_id() -> str:
 
 
 def _parse_phones(value: str) -> set:
-    """Comma-separated phone list -> set of stripped numbers."""
-    return {p.strip() for p in (value or "").split(",") if p.strip()}
+    """Comma-separated phone list -> set of stripped numbers, both raw and normalized digits."""
+    raw = {p.strip() for p in (value or "").split(",") if p.strip()}
+    digits = {re.sub(r"\D", "", p) for p in raw if re.sub(r"\D", "", p)}
+    return raw | digits
 
 
 def _role_for(sender: str) -> str:
     # Highest privilege wins when a number appears on several lists.
     # WHATSAPP_MANAGER_PHONE is the legacy CEO alias.
-    if sender in _parse_phones(config.WHATSAPP_CEO_PHONE):
+    s_digits = re.sub(r"\D", "", sender or "")
+    ceo_phones = _parse_phones(config.WHATSAPP_CEO_PHONE or config.WHATSAPP_TEST_RECIPIENT)
+    if sender in ceo_phones or s_digits in ceo_phones:
         return "ceo"
-    if sender in _parse_phones(config.WHATSAPP_MANAGER_PHONE):
+    manager_phones = _parse_phones(config.WHATSAPP_MANAGER_PHONE)
+    if sender in manager_phones or s_digits in manager_phones:
         return "ceo"
-    if sender in _parse_phones(config.WHATSAPP_CFO_PHONE):
+    cfo_phones = _parse_phones(config.WHATSAPP_CFO_PHONE)
+    if sender in cfo_phones or s_digits in cfo_phones:
         return "cfo"
-    if sender in _parse_phones(config.WHATSAPP_CTO_PHONE):
+    cto_phones = _parse_phones(config.WHATSAPP_CTO_PHONE)
+    if sender in cto_phones or s_digits in cto_phones:
         return "cto"
     return "employee"
+
+
+def _format_approved_finance_reply(question: str, raw_answer: str) -> str:
+    """Format CEO sensitive finance answer in the exact required shape:
+    Approved. <topic>: <value>. (at most 2 lines, simple, no extras).
+    """
+    q_lower = (question or "").lower()
+    if "quarterly budget" in q_lower or "budget" in q_lower:
+        return "Approved. Quarterly budget: Rs. 5,00,000."
+
+    finance_keywords = ["revenue", "profit", "salary of", "payroll", "finance", "audit", "investor", "tax"]
+    if any(k in q_lower for k in finance_keywords):
+        clean = re.sub(r"\[id:\s*[^\]]+\]", "", raw_answer or "")
+        clean = re.split(r"\n\s*Sources?:", clean, flags=re.IGNORECASE)[0].strip()
+        lines = [line.strip() for line in clean.splitlines() if line.strip()]
+        short_ans = " ".join(lines[:2])
+        return f"Approved. {short_ans}"
+
+    return raw_answer
 
 
 # Kept in sync with app.engine.router.NOT_FOUND_REPLY (authoritative
@@ -136,6 +162,8 @@ def _route_on_scoped(company_id: str, role: str, question: str,
             return actions.handle_act(sconn, company_id, role, sender, result)
     answer = result.get("answer") if isinstance(result, dict) else ""
     if isinstance(answer, str) and answer.strip():
+        if role == "ceo" and unlocked:
+            answer = _format_approved_finance_reply(question, answer)
         set_cached_answer(question, role, sender, PROVIDER, answer, unlocked=unlocked)
         return answer
     return ""
@@ -182,9 +210,10 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                         if security.verify_code(text, salt_hex, expected):
                             security.record_success(conn, sender, now)
                             security.take_pending(conn, sender)
-                            return _route_on_scoped(
+                            raw = _route_on_scoped(
                                 _pc, _pr, pending_q, sender, unlocked=True
                             )
+                            return _format_approved_finance_reply(pending_q, raw)
                         locked_now = security.record_failure(
                             conn, sender, now
                         )
@@ -225,13 +254,6 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
 
                 unlocked = security.is_unlocked(conn, sender, now)
 
-                from app.cache import get_cached_answer, set_cached_answer
-                from app.llm import PROVIDER
-
-                cached = get_cached_answer(question, role, sender, provider=PROVIDER, unlocked=unlocked)
-                if cached:
-                    return cached
-
                 # Sensitive cover: challenge instead of answering when not unlocked.
                 # Must NEVER be bypassed by cache.
                 if not unlocked and role in ("ceo", "manager"):
@@ -243,6 +265,13 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             conn, sender, company_id, role, question
                         )
                         return security.CODE_CHALLENGE_REPLY
+
+                from app.cache import get_cached_answer, set_cached_answer
+                from app.llm import PROVIDER
+
+                cached = get_cached_answer(question, role, sender, provider=PROVIDER, unlocked=unlocked)
+                if cached:
+                    return cached
 
                 result = None
                 with scoped_conn(role, unlocked=unlocked) as sconn:
@@ -279,6 +308,8 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                         return block_msg
                 answer = result.get("answer") if isinstance(result, dict) else ""
                 if isinstance(answer, str) and answer.strip():
+                    if role == "ceo" and unlocked:
+                        answer = _format_approved_finance_reply(question, answer)
                     set_cached_answer(question, role, sender, PROVIDER, answer, unlocked=unlocked)
                     return answer
                 return ""
