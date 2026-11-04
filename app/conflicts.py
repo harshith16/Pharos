@@ -159,13 +159,56 @@ def old_fact_citation(conn, memory_id: str):
 
 
 def format_alert(new_fact: str, doc_label: str, date_str: str, old_fact: str,
-                 new_doc: str = "", new_date: str = "") -> str:
-    """Show both values with their source documents and dates, and ask which is correct (at most 4 lines)."""
-    d1 = f"Doc 1 ({doc_label}, {date_str}): {_clean_fact_text(old_fact)}"
-    new_doc_label = new_doc or "New doc"
+                 new_doc: str = "", new_date: str = "", approver: str = "") -> str:
+    """Show both values with their source documents and dates, and state the approver is informed (at most 4 lines)."""
+    if not approver:
+        lower = f"{new_fact} {old_fact}".lower()
+        if "travel" in lower:
+            approver = "Head of Operations"
+        elif "finance" in lower or "budget" in lower:
+            approver = "Finance Manager"
+        else:
+            approver = "HR Lead"
+    d1 = f"- {doc_label} ({date_str}): {_clean_fact_text(old_fact)}"
+    new_doc_label = new_doc or "Policy Update"
     new_date_label = new_date or "recent"
-    d2 = f"Doc 2 ({new_doc_label}, {new_date_label}): {_clean_fact_text(new_fact)}"
-    return f"{d1}\n{d2}\nDo you know which is correct?"
+    d2 = f"- {new_doc_label} ({new_date_label}): {_clean_fact_text(new_fact)}"
+    return (
+        f"Conflict detected between documents:\n"
+        f"{d1}\n"
+        f"{d2}\n"
+        f"The {approver} has been informed."
+    )
+
+
+def get_open_conflict_message(conn, company_id: str, facts: list) -> str:
+    """Return the conflict alert message for any covering fact with an open conflict."""
+    try:
+        fids = [f["id"] for f in facts if isinstance(f, dict) and f.get("id")]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, old_memory_id, new_fact, new_filename, new_effective_date "
+                "FROM pending_conflicts WHERE company_id = %s "
+                "AND old_memory_id = ANY(%s::uuid[]) AND status = 'pending' "
+                "ORDER BY created_at LIMIT 1",
+                (company_id, fids),
+            )
+            row = cur.fetchone()
+            if row:
+                _id, old_id, new_fact, new_doc, new_date = row
+                old = conn.execute("SELECT fact FROM memories WHERE id = %s", (old_id,)).fetchone()
+                old_fact = old[0] if old else ""
+                doc_label, date_str = old_fact_citation(conn, old_id)
+                return format_alert(
+                    new_fact, doc_label, date_str, old_fact,
+                    new_doc=new_doc, new_date=str(new_date or ""),
+                )
+    except Exception:
+        pass
+    return (
+        "Conflict detected between documents on this topic.\n"
+        "The Head of Operations has been informed."
+    )
 
 
 def _alert_for_row(conn, row) -> str:
@@ -274,6 +317,11 @@ def store_facts_checked(conn, company_id: str, sender: str, doc_text: str,
         else:
             queued += 1
     conn.commit()
+    try:
+        from app.cache import clear_cache
+        clear_cache(company_id)
+    except Exception:
+        pass
     return stored_ids, alert, queued
 
 
@@ -489,4 +537,9 @@ def resolve_conflict(company_id: str, sender: str, yes: bool):
             _apply_operator_vars(conn)
             next_alert = _alert_for_row(conn, nxt)
         conn.commit()
+        try:
+            from app.cache import clear_cache
+            clear_cache(company_id)
+        except Exception:
+            pass
         return reply, next_alert

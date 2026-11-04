@@ -114,11 +114,15 @@ def _route_on_scoped(company_id: str, role: str, question: str,
                      sender: str, unlocked: bool):
     """Route one question on an RLS-scoped connection and, for ACT,
     execute the decided action. Returns the reply text ("" when the
-    router produced nothing sendable). The scoped connection carries
-    the sender's role and unlock state, so RLS hides sensitive rows
-    unless the code gate opened them — the role filter still applies
-    after unlock, so an unlocked employee still sees general only.
+    router produced nothing sendable).
     """
+    from app.cache import get_cached_answer, set_cached_answer
+    from app.llm import PROVIDER
+
+    cached = get_cached_answer(question, role, sender, provider=PROVIDER, unlocked=unlocked)
+    if cached:
+        return cached
+
     from app.db import scoped_conn
     from app.engine import router as engine_router
 
@@ -132,6 +136,7 @@ def _route_on_scoped(company_id: str, role: str, question: str,
             return actions.handle_act(sconn, company_id, role, sender, result)
     answer = result.get("answer") if isinstance(result, dict) else ""
     if isinstance(answer, str) and answer.strip():
+        set_cached_answer(question, role, sender, PROVIDER, answer, unlocked=unlocked)
         return answer
     return ""
 
@@ -139,27 +144,6 @@ def _route_on_scoped(company_id: str, role: str, question: str,
 def _answer_text(company_id: str, role: str, question: str, sender: str = "") -> str:
     """WhatsApp text answer, decided entirely by the engine router,
     with the 8-digit code gate (app.security) in front of it.
-
-    Gate flow, per sender, before any normal routing:
-    - a code-shaped message (exactly 8 digits) while a question is
-      pending is a code attempt, never an ordinary message: correct
-      -> unlock 30 minutes and answer the pending question at once
-      under the role filter; wrong -> incorrect reply, attempt
-      logged, pending kept for retry; 3rd consecutive failure ->
-      15-minute lockout reply. A code-shaped message with nothing
-      pending is treated normally (it is just a message).
-    - any other message routes normally, except: when the question's
-      covering facts include sensitive rows the sender's role may
-      see, the reply is the code challenge instead (no facts, no
-      hints) and the question is held as pending. Role-hidden facts
-      never reach the challenge — the role filter decides those,
-      code or no code.
-    Without a sender (direct library calls, older tests) the gate
-    has no one to track, so the question routes on a plain
-    connection exactly as before. An empty router answer (e.g. a
-    model failure on the small-talk route) returns "" so the caller
-    sends nothing. Only the router's answer text is ever returned;
-    no canned factual text and no word list lives here.
     """
     try:
         from datetime import datetime, timezone
@@ -238,7 +222,28 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                     )
                     if access_reply is not None:
                         return access_reply
+
                 unlocked = security.is_unlocked(conn, sender, now)
+
+                from app.cache import get_cached_answer, set_cached_answer
+                from app.llm import PROVIDER
+
+                cached = get_cached_answer(question, role, sender, provider=PROVIDER, unlocked=unlocked)
+                if cached:
+                    return cached
+
+                # Sensitive cover: challenge instead of answering when not unlocked.
+                # Must NEVER be bypassed by cache.
+                if not unlocked and role in ("ceo", "manager"):
+                    sensitive, _vis = security.find_sensitive_covering(
+                        conn, company_id, role, question
+                    )
+                    if sensitive:
+                        security.store_pending(
+                            conn, sender, company_id, role, question
+                        )
+                        return security.CODE_CHALLENGE_REPLY
+
                 result = None
                 with scoped_conn(role, unlocked=unlocked) as sconn:
                     result = engine_router.answer_question(
@@ -251,16 +256,6 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             sconn, company_id, role, sender, result
                         )
                 route = result.get("route") if isinstance(result, dict) else ""
-                # Sensitive cover: challenge instead of answering.
-                if route in ("ENGINE", "NOT_FOUND") and not unlocked:
-                    sensitive, _vis = security.find_sensitive_covering(
-                        conn, company_id, role, question
-                    )
-                    if sensitive:
-                        security.store_pending(
-                            conn, sender, company_id, role, question
-                        )
-                        return security.CODE_CHALLENGE_REPLY
                 # Role-block: a NOT_FOUND question covered only by
                 # facts this role may not see gets the next step,
                 # not the plain not-found text.
@@ -276,12 +271,15 @@ def _answer_text(company_id: str, role: str, question: str, sender: str = "") ->
                             company_id, sender, scope_label, approver,
                             approver_role, question,
                         )
-                        return (
+                        block_msg = (
                             f"Restricted to {scope_label}. "
                             f"Request access from {approver}?"
                         )
+                        set_cached_answer(question, role, sender, PROVIDER, block_msg, unlocked=unlocked)
+                        return block_msg
                 answer = result.get("answer") if isinstance(result, dict) else ""
                 if isinstance(answer, str) and answer.strip():
+                    set_cached_answer(question, role, sender, PROVIDER, answer, unlocked=unlocked)
                     return answer
                 return ""
             result = engine_router.answer_question(
@@ -512,7 +510,11 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
             text = f"Caption: {caption}"
     engine_entities = None
     conflict_alert = None
-    conflict_queued = 0
+    try:
+        from app.cache import clear_cache
+        clear_cache(company_id)
+    except Exception:
+        pass
     with scoped_conn("ceo", unlocked=True) as conn:
         ingest_media(
             conn,

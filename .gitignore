@@ -6,3 +6,4 @@ media/
 *.log
 credentials.json
 data/
+scratch/

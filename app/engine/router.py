@@ -568,10 +568,14 @@ def answer_question(conn, company_id, role, question) -> dict:
         # A fact with an open conflict must NOT be used to answer silently.
         if has_open_conflict(conn, company_id, result.get("facts") or []):
             out = dict(result)
-            out["answer"] = (
-                "There is an open conflict on this topic in your documents.\n"
-                "Please resolve the conflict before querying."
-            )
+            try:
+                from app.conflicts import get_open_conflict_message
+                out["answer"] = get_open_conflict_message(conn, company_id, result.get("facts") or [])
+            except Exception:
+                out["answer"] = (
+                    "Conflict detected between documents on this topic.\n"
+                    "The Head of Operations has been informed."
+                )
             return out
 
         # As-of questions get the deterministic version-chain
