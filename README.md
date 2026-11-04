@@ -148,3 +148,5 @@ claims it is already live.
   actually gate anything. The seed script warns about this.
 - WhatsApp delivery depends on a live tunnel and a current
   WhatsApp token; temporary tokens expire after 24 hours.
+
+Final commit.
