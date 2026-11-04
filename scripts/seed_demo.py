@@ -1,4 +1,4 @@
-"""Demo seed script (P2-8): one command, clean fictional-company state.
+"""Demo seed script: one command, clean fictional-company state.
 
 Command:
     PYTHONPATH=. python scripts/seed_demo.py [--company <id>]
@@ -13,7 +13,7 @@ What it does, in order:
    companies, never audit rows. Re-running is safe: the same
    21 facts and 8 documents every time.
 3. Loads the fictional Meridian Field Services facts from
-   app.demo_data (the same data the eval scores): 15 general,
+   app.demo_data: 15 general,
    3 finance (CFO+CEO), 2 technical (CTO+CEO), 1 executive
    (CEO-only), including two superseded pairs for as-of
    answers (travel 8000 -> 12000; internet 1500 -> 1850).
