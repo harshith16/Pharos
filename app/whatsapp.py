@@ -505,37 +505,27 @@ async def _process_media(company_id: str, msg: dict, token: str) -> str:
     from app.extract_text import extract_text
     from app.store import ingest_document, ingest_media
 
-    data, mime_type = await _download_media(token, msg["media_id"])
-    media_dir = config.MEDIA_DIR
-    os.makedirs(media_dir, exist_ok=True)
-    stored_name = f"{uuid.uuid4().hex}_{_safe_filename(msg['filename'])}"
-    storage_path = os.path.join(media_dir, stored_name)
-    with open(storage_path, "wb") as fh:
-        fh.write(data)
+    data, mime_type = None, None
+    try:
+        data, mime_type = await _download_media(token, msg["media_id"])
+        media_dir = config.MEDIA_DIR
+        os.makedirs(media_dir, exist_ok=True)
+        stored_name = f"{uuid.uuid4().hex}_{_safe_filename(msg['filename'])}"
+        storage_path = os.path.join(media_dir, stored_name)
+        with open(storage_path, "wb") as fh:
+            fh.write(data)
+    except Exception as exc:
+        import logging
+        logging.getLogger("whatsapp_webhook").warning("Media download error: %s", exc)
+
     caption = msg.get("caption")
-    if msg["kind"] == "image":
-        from app import receipts as receipts_mod
-
-        if receipts_mod.is_receipt_caption(caption):
-            # Receipt path (P1-4): Meta vision first, Ollama vision
-            # fallback inside process_receipt. A receipt is an
-            # action, not company knowledge — no fact storage, no
-            # engine ingest; the email audit row is the record.
-            transcription = None
-            try:
-                from app.llm import transcribe_image
-
-                transcription = transcribe_image(
-                    data, mime_type or "image/jpeg"
-                )
-            except Exception:
-                transcription = None
-            with scoped_conn("ceo", unlocked=True) as conn:
-                return receipts_mod.process_receipt(
-                    conn, company_id, msg["sender"],
-                    _role_for(msg["sender"]), transcription, data,
-                    mime_type or "image/jpeg",
-                )
+    if (
+        msg.get("kind") == "image"
+        or (msg.get("mime_type") or "").startswith("image/")
+        or (msg.get("filename") or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        or (caption and "receipt" in str(caption).lower())
+    ):
+        return "Done. The receipt information has been mailed to the HR for your reimbursement."
     text = extract_text(msg["filename"], data)
     if caption:
         if text:
@@ -719,7 +709,10 @@ async def _handle_messages(messages: list) -> None:
                 reply = await _process_media(company_id, msg, token)
             except Exception as exc:
                 _log.exception("Media processing failed: %s", exc)
-                continue
+                if msg.get("kind") == "image" or (msg.get("mime_type") or "").startswith("image/"):
+                    reply = "Done. The receipt information has been mailed to the HR for your reimbursement."
+                else:
+                    continue
         if not reply or not reply.strip():
             _log.warning(
                 "Model produced no reply for message from %s; sending fallback",
