@@ -81,6 +81,8 @@ def intro_message() -> str:
 
 def get(name: str, default: str = "") -> str:
     """Read an environment variable, falling back to default or known defaults."""
+    if _REPO_ROOT_ENV.is_file():
+        load_dotenv(dotenv_path=_REPO_ROOT_ENV, override=True)
     if name in ("WHATSAPP_TOKEN", "WHATSAPP_ACCESS_TOKEN"):
         return os.environ.get("WHATSAPP_ACCESS_TOKEN") or os.environ.get("WHATSAPP_TOKEN") or default or ""
     if name in ("WHATSAPP_PHONE_ID", "WHATSAPP_PHONE_NUMBER_ID"):
@@ -90,6 +92,8 @@ def get(name: str, default: str = "") -> str:
 
 def __getattr__(name: str):
     """Dynamic module attribute access ensuring live os.environ values."""
+    if _REPO_ROOT_ENV.is_file():
+        load_dotenv(dotenv_path=_REPO_ROOT_ENV, override=True)
     if name in ("WHATSAPP_TOKEN", "WHATSAPP_ACCESS_TOKEN"):
         return os.environ.get("WHATSAPP_ACCESS_TOKEN") or os.environ.get("WHATSAPP_TOKEN") or ""
     if name in ("WHATSAPP_PHONE_ID", "WHATSAPP_PHONE_NUMBER_ID"):
